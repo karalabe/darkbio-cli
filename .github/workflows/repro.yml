@@ -1,0 +1,57 @@
+name: WSAENOTCONN reproduction
+
+on:
+  push:
+    branches: [wsaenotconn-repro]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [connect_timeout, connect]
+        threads: [1, 4]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compile
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          rustc -Vv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc -O wsaenotconn.rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run 4000 connections
+        timeout-minutes: 7
+        shell: pwsh
+        env:
+          CONNECT_MODE: ${{ matrix.mode }}
+          CLIENT_THREADS: ${{ matrix.threads }}
+        run: |
+          .\wsaenotconn.exe 4000 $env:CLIENT_THREADS $env:CONNECT_MODE
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  linux-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compile
+        timeout-minutes: 2
+        run: |
+          rustc -Vv
+          rustc -O wsaenotconn.rs
+      - name: Run both modes with four clients
+        timeout-minutes: 7
+        run: |
+          timeout 180s ./wsaenotconn 4000 4 connect_timeout
+          timeout 180s ./wsaenotconn 4000 4 connect
