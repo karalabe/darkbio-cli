@@ -51,6 +51,8 @@ summary.json records every outcome and any repetitions skipped by the job budget
 The artifact also holds the tested executable, PDB symbols, applied patch, build
 logs and source, toolchain and runner metadata. ProcDump diagnostics accompany
 each attempted dump. The test source baseline is cli commit 5f5323c.
+Patch copies in the evidence folder use LF and UTF-8 without a BOM so indexed
+application works when checkout converts the tracked patch files to CRLF.
 #>
 param(
     [Parameter(Mandatory)][ValidateSet('Prepare', 'Run')][string]$Stage,
@@ -207,12 +209,15 @@ if ($Stage -eq 'Prepare') {
         'server-after-shutdown' { @('buffered.patch') }
     }
     foreach ($patchName in $patches) {
-        $patchFile = Join-Path $PSScriptRoot $patchName
+        # Match the LF index even when checkout gives the patch CRLF endings
+        $patchSource = Join-Path $PSScriptRoot $patchName
+        $patchFile = Join-Path $evidenceFolder $patchName
+        $patchText = [System.IO.File]::ReadAllText($patchSource).Replace("`r`n", "`n")
+        [System.IO.File]::WriteAllText($patchFile, $patchText, [System.Text.UTF8Encoding]::new($false))
         & git apply --index --check $patchFile
         if ($LASTEXITCODE -ne 0) { throw "Cannot apply $patchName to this branch" }
         & git apply --index $patchFile
         if ($LASTEXITCODE -ne 0) { throw "Could not apply $patchName" }
-        Copy-Item -LiteralPath $patchFile -Destination $evidenceFolder
     }
     & git diff HEAD --no-ext-diff | Out-File (Join-Path $evidenceFolder 'applied.patch') -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw 'Could not record the applied patch' }
