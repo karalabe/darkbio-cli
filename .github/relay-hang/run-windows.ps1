@@ -52,7 +52,12 @@ $repositoryFolder = (Resolve-Path -LiteralPath $Repository).Path
 $evidenceFolder = (New-Item -ItemType Directory -Force -Path $Evidence).FullName
 $targetFolder = (New-Item -ItemType Directory -Force -Path $TargetDirectory).FullName
 $env:CARGO_TARGET_DIR = $targetFolder
-[Environment]::SetEnvironmentVariable('RUST_TEST_THREADS', $null)
+
+# Remove the key entirely so libtest selects its default thread count
+Remove-Item -LiteralPath Env:RUST_TEST_THREADS -ErrorAction SilentlyContinue
+if ([Environment]::GetEnvironmentVariables().Contains('RUST_TEST_THREADS')) {
+    throw 'RUST_TEST_THREADS must be absent, including an empty value'
+}
 Set-Location -LiteralPath $repositoryFolder
 $metadataFile = Join-Path $evidenceFolder 'build-metadata.json'
 
@@ -197,6 +202,7 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
     try {
         # Leave libtest's test selection and thread count at their defaults
         $process = Start-Process -FilePath $metadata.executable -ArgumentList @('--nocapture') -PassThru `
+            -WorkingDirectory $repositoryFolder `
             -RedirectStandardOutput "$stem.stdout" -RedirectStandardError "$stem.stderr"
         $record.process_id = $process.Id
         $stdout = Open-OutputReader "$stem.stdout"
