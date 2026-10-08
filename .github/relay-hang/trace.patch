@@ -1,6 +1,6 @@
 --- a/connect/src/cloud/socket.rs
 +++ b/connect/src/cloud/socket.rs
-@@ -29,6 +29,19 @@
+@@ -29,6 +29,37 @@
  /// handle that shuts it down.
  type OnConnect<'a> = &'a dyn Fn(&TcpStream) -> Result<(), Failure>;
  
@@ -10,29 +10,56 @@
 +pub(super) fn trace(event: &str, detail: impl std::fmt::Debug) {
 +    /// Monotonic origin shared by this test process's diagnostics.
 +    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-+    eprintln!(
++    /// Per-process trace file, separate from libtest's console output.
++    static OUTPUT: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> =
++        std::sync::OnceLock::new();
++    let line = format!(
 +        "[relay-trace {:?} {:?}] {event} {detail:?}",
 +        START.get_or_init(Instant::now).elapsed(),
 +        std::thread::current()
 +    );
++    let output = OUTPUT.get_or_init(|| {
++        let path = std::env::var_os("RELAY_TRACE_FILE").expect("trace file configured by harness");
++        std::sync::Mutex::new(std::fs::File::create(path).expect("trace file writable"))
++    });
++    writeln!(output.lock().unwrap(), "{line}").expect("trace event written");
++}
++
++/// Records a native handle without querying or changing the socket's state.
++#[cfg(test)]
++pub(super) fn trace_socket(event: &str, socket: &TcpStream, detail: impl std::fmt::Debug) {
++    #[cfg(windows)]
++    let handle = std::os::windows::io::AsRawSocket::as_raw_socket(socket);
++    #[cfg(unix)]
++    let handle = std::os::fd::AsRawFd::as_raw_fd(socket);
++    trace(event, (handle, detail));
 +}
 +
  /// Opens a cloud socket that must agree on the requested subprotocol, carrying
  /// the Ark's `auth` proof in the upgrade.
  ///
-@@ -96,7 +109,11 @@
+@@ -87,6 +118,8 @@
+         let left = api.clock.remaining(deadline).map_err(io_error)?;
+         match TcpStream::connect_timeout(&address, left) {
+             Ok(stream) => {
++                #[cfg(test)]
++                trace_socket("tcp connected", &stream, address);
+                 connected = Some(stream);
+                 break;
+             }
+@@ -96,7 +129,11 @@
      let stream = connected.ok_or_else(|| io_error(failure))?;
      stream.set_nodelay(true).map_err(io_error)?;
      if let Some(on_connect) = on_connect {
 +        #[cfg(test)]
-+        trace("on_connect enter", &stream);
++        trace_socket("on_connect enter", &stream, ());
          on_connect(&stream)?;
 +        #[cfg(test)]
-+        trace("on_connect exit", &stream);
++        trace_socket("on_connect exit", &stream, ());
      }
  
      // Upgrade with frames and messages capped at what one wire message carries
-@@ -177,8 +194,19 @@
+@@ -177,8 +214,19 @@
                  stream,
                  deadline,
              } => {
@@ -40,21 +67,21 @@
 -                stream.read(bytes)
 +                let left = clock.remaining(*deadline)?;
 +                #[cfg(test)]
-+                trace("set_read_timeout enter", (&stream, left));
++                trace_socket("set_read_timeout enter", stream, left);
 +                let result = stream.set_read_timeout(Some(left));
 +                #[cfg(test)]
-+                trace("set_read_timeout exit", (&stream, &result));
++                trace_socket("set_read_timeout exit", stream, &result);
 +                result?;
 +                #[cfg(test)]
-+                trace("read enter", &stream);
++                trace_socket("read enter", stream, ());
 +                let result = stream.read(bytes);
 +                #[cfg(test)]
-+                trace("read exit", (&stream, &result));
++                trace_socket("read exit", stream, &result);
 +                result
              }
              Self::Connected { stream, .. } => stream.read(bytes),
          }
-@@ -195,8 +223,19 @@
+@@ -195,8 +243,19 @@
                  stream,
                  deadline,
              } => {
@@ -62,16 +89,16 @@
 -                stream.write(bytes)
 +                let left = clock.remaining(*deadline)?;
 +                #[cfg(test)]
-+                trace("set_write_timeout enter", (&stream, left));
++                trace_socket("set_write_timeout enter", stream, left);
 +                let result = stream.set_write_timeout(Some(left));
 +                #[cfg(test)]
-+                trace("set_write_timeout exit", (&stream, &result));
++                trace_socket("set_write_timeout exit", stream, &result);
 +                result?;
 +                #[cfg(test)]
-+                trace("write enter", &stream);
++                trace_socket("write enter", stream, ());
 +                let result = stream.write(bytes);
 +                #[cfg(test)]
-+                trace("write exit", (&stream, &result));
++                trace_socket("write exit", stream, &result);
 +                result
              }
              Self::Connected {
@@ -84,15 +111,15 @@
          if let Some(socket) = &self.socket {
 -            let _ = socket.shutdown(Shutdown::Both);
 +            #[cfg(test)]
-+            super::socket::trace("shutdown enter", socket);
++            super::socket::trace_socket("shutdown enter", socket, ());
 +            let result = socket.shutdown(Shutdown::Both);
 +            #[cfg(test)]
-+            super::socket::trace("shutdown exit", (socket, &result));
++            super::socket::trace_socket("shutdown exit", socket, &result);
 +            let _ = result;
          }
      }
  }
-@@ -415,7 +420,11 @@
+@@ -415,7 +420,14 @@
      /// Ends the relay for good, releasing explicit joins and refusing the
      /// queued frames.
      fn close(&self) {
@@ -100,20 +127,32 @@
 +        super::socket::trace("close before state lock", self as *const Self);
          let mut state = self.state.lock().expect("relay state not poisoned");
 +        #[cfg(test)]
-+        super::socket::trace("close acquired state lock", (&state.socket, state.closed));
++        super::socket::trace(
++            "close acquired state lock",
++            (state.socket.is_some(), state.closed),
++        );
          if state.closed {
              return;
          }
-@@ -474,6 +483,8 @@
+@@ -448,6 +460,8 @@
+             return Err(protocol::Error::Timeout.into());
+         }
+         state.socket = Some(socket.try_clone().map_err(io_error)?);
++        #[cfg(test)]
++        super::socket::trace_socket("control installed", state.socket.as_ref().unwrap(), ());
+         Ok(())
+     }
+ 
+@@ -474,6 +488,8 @@
              refused.push((frame.responder, cause));
          }
          if state.joining.is_some_and(|deadline| deadline <= now) {
 +            #[cfg(test)]
-+            super::socket::trace("expire join", (&state.socket, now, state.joining));
++            super::socket::trace("expire join", (state.socket.is_some(), now, state.joining));
              state.interrupted = true;
              state.shutdown();
              if let Some((attempt, _)) = state.waiter.take() {
-@@ -715,6 +726,8 @@
+@@ -715,6 +731,8 @@
  /// A failed join refuses the frames waiting on it, while a failed socket
  /// leaves its queued frames to the next one.
  fn ended(shared: &Shared, error: Failure, joining: bool) {
@@ -122,7 +161,7 @@
      let cause = crate::Error::from(error.clone()).to_string();
      let cause = if joining {
          format!("relay join failed: {cause}")
-@@ -1197,7 +1210,9 @@
+@@ -1197,7 +1215,9 @@
  
          /// Answers the next join with the token expected by the loopback server.
          fn join(&self) {
@@ -132,22 +171,38 @@
              assert!(matches!(request, Content::RelayJoin(_)));
              responder
                  .reply(
-@@ -1240,12 +1255,14 @@
+@@ -1227,12 +1247,14 @@
+     fn cloud() -> (TcpListener, String) {
+         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+         let url = format!("http://{}/v1", listener.local_addr().unwrap());
++        super::super::socket::trace("test cloud", &url);
+         (listener, url)
+     }
+ 
+     /// Accepts one connection, bounding its I/O in case a test fails.
+     fn accept(listener: &TcpListener) -> TcpStream {
+-        let (stream, _) = listener.accept().unwrap();
++        let (stream, peer) = listener.accept().unwrap();
++        super::super::socket::trace_socket("server accepted", &stream, peer);
+         stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+         stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+         stream
+@@ -1240,12 +1262,14 @@
  
      /// Reads the HTTP headers without consuming WebSocket bytes.
      fn headers(stream: &mut TcpStream) -> String {
-+        super::super::socket::trace("server headers enter", &stream);
++        super::super::socket::trace_socket("server headers enter", stream, ());
          let mut bytes = Vec::new();
          while !bytes.ends_with(b"\r\n\r\n") {
              let mut byte = [0];
              stream.read_exact(&mut byte).unwrap();
              bytes.push(byte[0]);
          }
-+        super::super::socket::trace("server headers exit", &stream);
++        super::super::socket::trace_socket("server headers exit", stream, ());
          String::from_utf8(bytes).unwrap()
      }
  
-@@ -1297,6 +1314,7 @@
+@@ -1297,6 +1321,7 @@
  
      /// Requires EOF, a reset or an abort from a raw socket read.
      fn assert_stream_closed(result: io::Result<usize>) {
@@ -155,7 +210,7 @@
          match result {
              Ok(0) => {}
              Err(error)
-@@ -1619,6 +1637,7 @@
+@@ -1619,6 +1644,7 @@
      /// sent later.
      #[test]
      fn test_hold_deadline() {
@@ -163,11 +218,11 @@
          let mut tester = test_clock();
          let clock = tester.clock();
          let (listener, url) = cloud();
-@@ -1628,16 +1647,23 @@
+@@ -1628,16 +1654,23 @@
              let mut stream = accept(&listener);
              headers(&mut stream);
              stalled.send(()).unwrap();
-+            super::super::socket::trace("hold server read enter", &stream);
++            super::super::socket::trace_socket("hold server read enter", &stream, ());
              assert_stream_closed(stream.read(&mut [0]));
 +            super::super::socket::trace("hold server sync enter", ());
              sync(&listener);
@@ -187,7 +242,7 @@
  
          // Let the frame's hold run out on the test clock, cutting the upgrade short
          let shared = fixture.shared();
-@@ -1645,19 +1671,30 @@
+@@ -1645,19 +1678,30 @@
          let (resume, resumed) = crossbeam_channel::bounded(0);
          *shared.rearming.lock().unwrap() = Some((rearming, resumed));
          shared.signal();
@@ -218,3 +273,19 @@
      }
  
      /// A join due while rearming is interrupted while later timers keep working.
+@@ -1800,6 +1844,7 @@
+             let mut stream = accept(&listener);
+             headers(&mut stream);
+             stalled.send(()).unwrap();
++            super::super::socket::trace_socket("stalled cause server read enter", &stream, ());
+             assert_stream_closed(stream.read(&mut [0]));
+         });
+         let fixture = Fixture::new(&clock, url);
+@@ -2171,6 +2216,7 @@
+             let mut stream = accept(&listener);
+             headers(&mut stream);
+             stalled.send(()).unwrap();
++            super::super::socket::trace_socket("close server read enter", &stream, ());
+             assert_stream_closed(stream.read(&mut [0]));
+         });
+         let fixture = Fixture::new(&clock, url);

@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: full
   RELAY_BASELINE_REPETITIONS: '20'
-  RELAY_OTHER_REPETITIONS: '10'
+  RELAY_OTHER_REPETITIONS: '20'
   RELAY_WATCHDOG_SECONDS: '30'
   RELAY_DUMP_TIMEOUT_SECONDS: '15'
   RELAY_MAX_DUMPS: '2'
@@ -30,16 +30,16 @@ jobs:
         include:
           - {variant: baseline, shard: '01'}
           - {variant: baseline, shard: '02'}
-          - {variant: baseline, shard: '03'}
-          - {variant: baseline, shard: '04'}
-          - {variant: baseline, shard: '05'}
-          - {variant: baseline, shard: '06'}
-          - {variant: baseline, shard: '07'}
-          - {variant: baseline, shard: '08'}
-          - {variant: baseline, shard: '09'}
-          - {variant: baseline, shard: '10'}
           - {variant: traced, shard: '01'}
-          - {variant: guarded, shard: '01'}
+          - {variant: traced, shard: '02'}
+          - {variant: traced, shard: '03'}
+          - {variant: traced, shard: '04'}
+          - {variant: shared-handle, shard: '01'}
+          - {variant: shared-handle, shard: '02'}
+          - {variant: split-shutdown, shard: '01'}
+          - {variant: split-shutdown, shard: '02'}
+          - {variant: peer-fenced, shard: '01'}
+          - {variant: peer-fenced, shard: '02'}
     env:
       RELAY_VARIANT: ${{ matrix.variant }}
       RELAY_SHARD: ${{ matrix.shard }}

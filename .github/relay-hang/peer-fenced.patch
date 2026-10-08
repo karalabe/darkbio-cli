@@ -1,0 +1,67 @@
+--- a/connect/src/ark.rs
++++ b/connect/src/ark.rs
+@@ -724,6 +724,7 @@
+     /// Wire answers unknown content automatically while known requests continue
+     /// through the host's receive loop.
+     #[test]
++    #[expect(clippy::disallowed_methods, reason = "bounds a failed test only")]
+     fn test_unknown_requests() {
+         use crate::testing::self_attestation;
+         use darkbio_crypto::xdsa;
+@@ -748,6 +749,7 @@
+         let identity = signer.public_key();
+         let attestation = self_attestation(&signer, identity.clone(), &clock);
+         let (host, remote) = memory::duplex(256 * 1024, &clock);
++        let (release, released) = std::sync::mpsc::channel();
+         let peer = thread::spawn(move || {
+             let mut server = transport::Server::new(remote, signer, attestation);
+             let transport::Event::Connected(sender) = server.recv().unwrap() else {
+@@ -781,6 +783,8 @@
+                 assert!(reply.content.is_none());
+                 replies.insert(reply.id, reply.err.unwrap().code);
+             }
++            // Keep the transport alive until the host's reply promise settles
++            released.recv_timeout(TIMEOUT).unwrap();
+             replies
+         });
+ 
+@@ -809,6 +813,7 @@
+ 
+         // Both replies have been written. Close before joining so a missing reply
+         // causes a peer EOF rather than leaving this test waiting indefinitely.
++        release.send(()).unwrap();
+         ark.close();
+         let replies = peer.join().unwrap();
+         assert_eq!(
+@@ -979,12 +984,14 @@
+ 
+     /// Without a cloud route, the application receives and acknowledges relay frames.
+     #[test]
++    #[expect(clippy::disallowed_methods, reason = "bounds a failed test only")]
+     fn test_reverse_requests() {
+         // The peer answers an unlock after the host answers its relay request
+         let clock = test_clock().clock();
++        let (settled, settlement) = std::sync::mpsc::channel();
+         let mut peer = Peer::spawn(
+             &clock,
+-            Box::new(|session, _, responder| {
++            Box::new(move |session, _, responder| {
+                 let deadline = session.clock().now() + TIMEOUT;
+                 // Unlock waits until the application acknowledges the frame
+                 session
+@@ -1003,6 +1010,7 @@
+                     .unwrap()
+                     .wait()
+                     .unwrap();
++                settled.send(()).unwrap();
+                 true
+             }),
+         );
+@@ -1023,6 +1031,7 @@
+             .wait()
+             .unwrap();
+         operation.join().unwrap().unwrap();
++        settlement.recv_timeout(TIMEOUT).unwrap();
+     }
+ 
+     /// Request handles can move between threads before choosing where to

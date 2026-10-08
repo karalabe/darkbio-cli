@@ -3,12 +3,16 @@
 Builds and repeats this branch's connect tests with bounded failure capture.
 .DESCRIPTION
 The workflow sets variant, repetitions, watchdogs and dump limits through RELAY_*
-environment variables. Baseline uses unchanged source. Traced and guarded apply
-their respective patches before building. All runs use --nocapture and libtest's
+environment variables. Baseline uses unchanged source. Traced writes syscall
+events to a per-run file. Shared-handle and split-shutdown layer one change each
+over that trace. Peer-fenced changes only the two Ark tests' teardown ordering.
+Guarded remains available for manual use. All runs use --nocapture and libtest's
 default thread count. Failures and hangs do not stop later repetitions.
 
-Each run writes run-NNN.stdout, run-NNN.stderr and run-NNN.status.json. Output is
-also forwarded to the Actions log while the test runs. A watchdog expiry records
+Each run writes run-NNN.stdout, run-NNN.stderr and run-NNN.status.json. The timeline
+JSONL timestamps output chunks when observed by the harness, with polling and
+scheduling delay. Traced variants also write run-NNN.trace at the event source.
+Output is forwarded to the Actions log while the test runs. A watchdog expiry records
 outcome timeout, captures a dump up to RELAY_MAX_DUMPS times per job, and kills
 the process tree. A returned nonzero exit records outcome failed. A server panic
 can appear in stderr followed by timeout if the parent test remains blocked.
@@ -31,8 +35,8 @@ Set-StrictMode -Version Latest
 
 # Validate the workflow settings before launching any process
 $variant = $env:RELAY_VARIANT
-if ($variant -notin @('baseline', 'traced', 'guarded')) {
-    throw 'RELAY_VARIANT must be baseline, traced or guarded'
+if ($variant -notin @('baseline', 'traced', 'guarded', 'shared-handle', 'split-shutdown', 'peer-fenced')) {
+    throw 'Unsupported RELAY_VARIANT'
 }
 $repetitions = if ($variant -eq 'baseline') {
     [int]$env:RELAY_BASELINE_REPETITIONS
@@ -87,9 +91,22 @@ function Write-ProcessOutput {
     <# .SYNOPSIS
     Forwards newly appended test output to the Actions log without consuming it.
     #>
-    param([System.IO.StreamReader]$StandardOutput, [System.IO.StreamReader]$StandardError)
-    if ($null -ne $StandardOutput) { [Console]::Out.Write($StandardOutput.ReadToEnd()) }
-    if ($null -ne $StandardError) { [Console]::Error.Write($StandardError.ReadToEnd()) }
+    param(
+        [System.IO.StreamReader]$StandardOutput,
+        [System.IO.StreamReader]$StandardError,
+        [System.Diagnostics.Stopwatch]$Clock,
+        [System.IO.StreamWriter]$Timeline
+    )
+    foreach ($name in @('stdout', 'stderr')) {
+        $reader = if ($name -eq 'stdout') { $StandardOutput } else { $StandardError }
+        if ($null -eq $reader) { continue }
+        $chunk = $reader.ReadToEnd()
+        if ($chunk.Length -eq 0) { continue }
+        $Timeline.WriteLine((@{
+            elapsed_seconds = $Clock.Elapsed.TotalSeconds; stream = $name; text = $chunk
+        } | ConvertTo-Json -Compress))
+        if ($name -eq 'stdout') { [Console]::Out.Write($chunk) } else { [Console]::Error.Write($chunk) }
+    }
 }
 
 function Save-ProcessDump {
@@ -109,7 +126,18 @@ function Save-ProcessDump {
             Stop-TestProcess $dump
             return 'capture_timeout'
         }
-        if ($dump.ExitCode -eq 0 -and (Test-Path -LiteralPath $dumpFile)) { return 'captured' }
+        # Preserve a dump independently of the utility's exit-code convention
+        if (Test-Path -LiteralPath $dumpFile -PathType Leaf) {
+            $file = [System.IO.File]::OpenRead($dumpFile)
+            try {
+                $magic = [byte[]]::new(4)
+                if ($file.Length -ge 32 -and $file.Read($magic, 0, 4) -eq 4 -and
+                    [System.Text.Encoding]::ASCII.GetString($magic) -eq 'MDMP') {
+                    if ($dump.ExitCode -eq 0) { return 'captured' }
+                    return "dump_present_exit_$($dump.ExitCode)"
+                }
+            } finally { $file.Dispose() }
+        }
         return "capture_failed_exit_$($dump.ExitCode)"
     } catch {
         $_ | Out-File -LiteralPath "$Stem.procdump.error" -Encoding utf8
@@ -137,8 +165,15 @@ if ($Stage -eq 'Prepare') {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceFolder 'subject.json') -Encoding utf8
 
     # Only diagnostic variants change the checked-out source before building
-    if ($variant -ne 'baseline') {
-        $patchName = if ($variant -eq 'traced') { 'trace.patch' } else { 'test-lifecycle.patch' }
+    $patches = switch ($variant) {
+        'baseline' { @() }
+        'traced' { @('trace.patch') }
+        'guarded' { @('test-lifecycle.patch') }
+        'shared-handle' { @('trace.patch', 'shared-handle.patch') }
+        'split-shutdown' { @('trace.patch', 'split-shutdown.patch') }
+        'peer-fenced' { @('peer-fenced.patch') }
+    }
+    foreach ($patchName in $patches) {
         $patchFile = Join-Path $PSScriptRoot $patchName
         & git apply --check $patchFile
         if ($LASTEXITCODE -ne 0) { throw "Cannot apply $patchName to this branch" }
@@ -193,6 +228,9 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
     $stdout = $null
     $stderr = $null
     $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
+    $timeline = [System.IO.StreamWriter]::new("$stem.timeline.jsonl", $false)
+    $timeline.AutoFlush = $true
+    $env:RELAY_TRACE_FILE = "$stem.trace"
     $record = [ordered]@{
         iteration = $iteration; outcome = 'harness_error'; exit_code = $null
         process_id = $null
@@ -208,7 +246,7 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
         $stdout = Open-OutputReader "$stem.stdout"
         $stderr = Open-OutputReader "$stem.stderr"
         while (-not $process.WaitForExit(200)) {
-            Write-ProcessOutput $stdout $stderr
+            Write-ProcessOutput $stdout $stderr $elapsed $timeline
             if ($elapsed.Elapsed.TotalSeconds -ge $watchdogSeconds) {
                 $record.outcome = 'timeout'
                 if ($dumpCount -lt $maxDumps) {
@@ -236,7 +274,8 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
                 if ($record.outcome -eq 'passed') { $record.outcome = 'harness_error' }
             }
         }
-        Write-ProcessOutput $stdout $stderr
+        Write-ProcessOutput $stdout $stderr $elapsed $timeline
+        $timeline.Dispose()
         if ($null -ne $stdout) { $stdout.Dispose() }
         if ($null -ne $stderr) { $stderr.Dispose() }
         if ($null -ne $process) { $process.Dispose() }
