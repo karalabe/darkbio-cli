@@ -32,14 +32,14 @@ jobs:
           - {variant: baseline, shard: '02'}
           - {variant: shared-handle, shard: '01'}
           - {variant: shared-handle, shard: '02'}
-          - {variant: split-shutdown, shard: '01'}
-          - {variant: split-shutdown, shard: '02'}
-          - {variant: buffered, shard: '01'}
-          - {variant: buffered, shard: '02'}
-          - {variant: worker-after-shutdown, shard: '01'}
-          - {variant: worker-after-shutdown, shard: '02'}
-          - {variant: server-after-shutdown, shard: '01'}
-          - {variant: server-after-shutdown, shard: '02'}
+          - {variant: shared-handle, shard: '03'}
+          - {variant: shared-handle, shard: '04'}
+          - {variant: shared-handle, shard: '05'}
+          - {variant: shared-handle, shard: '06'}
+          - {variant: shared-handle, shard: '07'}
+          - {variant: shared-handle, shard: '08'}
+          - {variant: shared-handle, shard: '09'}
+          - {variant: shared-handle, shard: '10'}
     env:
       RELAY_VARIANT: ${{ matrix.variant }}
       RELAY_SHARD: ${{ matrix.shard }}

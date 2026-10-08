@@ -1,6 +1,16 @@
+diff --git a/connect/src/cloud/mod.rs b/connect/src/cloud/mod.rs
+index 6d3f9d7..a5d5a76 100644
 --- a/connect/src/cloud/mod.rs
 +++ b/connect/src/cloud/mod.rs
-@@ -352,7 +352,7 @@
+@@ -346,13 +346,13 @@ impl Services {
+ 
+     /// Opens a relay socket with a fresh join token from the Ark.
+     ///
+-    /// `connected` receives the TCP stream before the upgrade starts, so the
+-    /// relay can shut it down to interrupt a stalled upgrade.
++    /// `connected` receives the original TCP handle before the upgrade starts,
++    /// so the relay can shut it down if the upgrade stalls.
+     fn join(
          &self,
          requester: &Requester,
          timing: Timing,
@@ -9,19 +19,42 @@
      ) -> Result<socket::Connection, Failure> {
          let cloud = self.cloud.as_ref().expect("cloud route available");
          self.authenticate(requester, timing, || {
+diff --git a/connect/src/cloud/relay.rs b/connect/src/cloud/relay.rs
+index ec4cfa8..a0d3ab7 100644
 --- a/connect/src/cloud/relay.rs
 +++ b/connect/src/cloud/relay.rs
-@@ -156,7 +156,7 @@
+@@ -155,8 +155,9 @@ struct State {
+     bytes: usize,
      /// Whether the queue's first frame is partly written to the socket.
      writing: bool,
-     /// Handle that shuts the current socket down, set once its TCP connects.
+-    /// Handle that shuts the current socket down, set once its TCP connects.
 -    socket: Option<TcpStream>,
++    /// Original TCP handle used for shutdown, retained through the upgrade and
++    /// the readiness loop.
 +    socket: Option<Arc<TcpStream>>,
      /// Whether the current socket finished its upgrade.
      connected: bool,
      /// Whether a join succeeded, which keeps the relay joined for the session.
-@@ -435,7 +435,7 @@
-     /// starts.
+@@ -389,8 +390,10 @@ impl State {
+         Some(RelayNotice::Failed(cause.into()))
+     }
+ 
+-    /// Shuts the socket down, which also interrupts a stalled upgrade or a
+-    /// partly written frame.
++    /// Shuts the socket down on a best-effort basis.
++    ///
++    /// On Windows, a blocked upgrade read can still wait for its I/O timeout
++    /// or for the peer to close. Join waiters and frames are released separately.
+     fn shutdown(&self) {
+         if let Some(socket) = &self.socket {
+             let _ = socket.shutdown(Shutdown::Both);
+@@ -431,11 +434,10 @@ impl Shared {
+         self.signal();
+     }
+ 
+-    /// Keeps a handle that shuts a joining socket down, before its upgrade
+-    /// starts.
++    /// Retains the joining socket's original handle before its upgrade starts.
      ///
      /// A closed relay or a passed join deadline abandons the socket instead.
 -    fn socket(&self, socket: &TcpStream) -> Result<(), Failure> {
@@ -29,18 +62,105 @@
          let mut state = self.state.lock().expect("relay state not poisoned");
          if state.closed {
              return Err(protocol::Error::Closed.into());
-@@ -447,7 +447,7 @@
+@@ -447,7 +449,8 @@ impl Shared {
          {
              return Err(protocol::Error::Timeout.into());
          }
 -        state.socket = Some(socket.try_clone().map_err(io_error)?);
++        // A duplicated handle can reject shutdown with WSAENOTCONN on Windows
 +        state.socket = Some(socket.clone());
          Ok(())
      }
  
+@@ -686,7 +689,8 @@ fn ready(mut socket: Connection, poll: &Poll, shared: &Shared) -> Result<Connect
+         return Err(protocol::Error::Closed.into());
+     }
+ 
+-    // Make the stream nonblocking under its TLS state and register it
++    // Register a nonblocking duplicate for I/O, retaining the original handle
++    // in shared state for shutdown
+     let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
+         unreachable!()
+     };
+@@ -2161,7 +2165,72 @@ mod tests {
+         }
+     }
+ 
+-    /// Ending a relay refuses queued frames and interrupts an unfinished upgrade.
++    /// Shutdown retains the original TCP handle through the upgrade and
++    /// readiness registration, then closes the peer's stream.
++    #[test]
++    fn test_shutdown_retains_original_handle() {
++        // Complete a real upgrade, leaving the peer waiting for closure
++        let clock = test_clock().clock();
++        let (listener, url) = cloud();
++        let server = thread::spawn(move || {
++            let mut socket = upgrade(accept(&listener));
++            assert_socket_closed(socket.read());
++        });
++        let api = http::tests::api(url, Realm::Hardware, &clock);
++        let deadline = clock.now() + TIMEOUT;
++        let poll = Poll::new().unwrap();
++        let (changed, _changes) = crossbeam_channel::bounded(1);
++        let shared = Shared {
++            clock,
++            state: Mutex::new(State {
++                joining: Some(deadline),
++                ..Default::default()
++            }),
++            wake: Arc::new(Waker::new(poll.registry(), WAKE).unwrap()),
++            changed,
++            notices: Arc::new(Observer::default()),
++            rearming: Mutex::new(None),
++        };
++        let mut socket = super::super::socket::connect(
++            &api,
++            &api.relay_url(),
++            &[0xfb, 0xff],
++            "Relaying",
++            deadline,
++            Some(&|socket| shared.socket(socket)),
++        )
++        .unwrap();
++
++        // Require the same handle, even on platforms where a duplicate shuts
++        // down successfully, so this regression does not depend on a race
++        let original = {
++            let Socket::Blocking { stream, .. } = socket_mut(&mut socket) else {
++                unreachable!()
++            };
++            let state = shared.state.lock().unwrap();
++            assert!(Arc::ptr_eq(stream, state.socket.as_ref().unwrap()));
++            Arc::downgrade(stream)
++        };
++
++        // Keep the original shutdown handle when I/O moves to the poller
++        let socket = ready(socket, &poll, &shared).unwrap();
++        {
++            let state = shared.state.lock().unwrap();
++            assert!(Arc::ptr_eq(
++                &original.upgrade().unwrap(),
++                state.socket.as_ref().unwrap()
++            ));
++        }
++        shared.close();
++        server.join().unwrap();
++
++        // Release the original handle once the failed attempt is torn down
++        ended(&shared, protocol::Error::Closed.into(), false);
++        assert!(original.upgrade().is_none());
++        drop(socket);
++    }
++
++    /// Ending a relay refuses queued frames and closes a stalled upgrade's peer.
+     #[test]
+     fn test_close_during_join() {
+         let clock = test_clock().clock();
+diff --git a/connect/src/cloud/socket.rs b/connect/src/cloud/socket.rs
+index 09967bb..86ebbcb 100644
 --- a/connect/src/cloud/socket.rs
 +++ b/connect/src/cloud/socket.rs
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,7 @@ use darkbio_clock::Clock;
  use darkbio_wire::protocol;
  use std::io::{self, Read, Write};
  use std::net::TcpStream;
@@ -48,16 +168,20 @@
  use std::time::Instant;
  use tungstenite::{
      WebSocket, client::IntoClientRequest, handshake::HandshakeError, protocol::WebSocketConfig,
-@@ -27,7 +28,7 @@
+@@ -25,9 +26,9 @@ const MAX_MESSAGE: usize = darkbio_wire::transport::MAX_MESSAGE_SIZE;
+ /// Cloud WebSocket retaining its TLS state when switched to readiness polling.
+ pub(super) type Connection = WebSocket<MaybeTlsStream<Socket>>;
  
- /// Callback that sees the TCP stream before the upgrade, such as to keep a
- /// handle that shuts it down.
+-/// Callback that sees the TCP stream before the upgrade, such as to keep a
+-/// handle that shuts it down.
 -type OnConnect<'a> = &'a dyn Fn(&TcpStream) -> Result<(), Failure>;
++/// Callback that can retain the original TCP handle before the upgrade, so
++/// shutdown uses the same handle as the blocking I/O.
 +type OnConnect<'a> = &'a dyn Fn(&Arc<TcpStream>) -> Result<(), Failure>;
  
  /// Opens a cloud socket that must agree on the requested subprotocol, carrying
  /// the Ark's `auth` proof in the upgrade.
-@@ -93,7 +94,7 @@
+@@ -93,7 +94,7 @@ pub(super) fn connect(
              Err(error) => failure = error,
          }
      }
@@ -66,16 +190,19 @@
      stream.set_nodelay(true).map_err(io_error)?;
      if let Some(on_connect) = on_connect {
          on_connect(&stream)?;
-@@ -153,7 +154,7 @@
+@@ -152,8 +153,9 @@ pub(super) enum Socket {
+     Blocking {
          /// Clock of the connection, which the deadline is measured on.
          clock: Clock,
-         /// Connected TCP socket, optionally wrapped by TLS above this adapter.
+-        /// Connected TCP socket, optionally wrapped by TLS above this adapter.
 -        stream: TcpStream,
++        /// Original TCP handle, shared with the relay for shutdown and
++        /// optionally wrapped by TLS above this adapter.
 +        stream: Arc<TcpStream>,
          /// Absolute bound, turned into a fresh timeout before each blocking I/O.
          deadline: Instant,
      },
-@@ -178,7 +179,7 @@
+@@ -178,7 +180,7 @@ impl Read for Socket {
                  deadline,
              } => {
                  stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
@@ -84,7 +211,7 @@
              }
              Self::Connected { stream, .. } => stream.read(bytes),
          }
-@@ -196,7 +197,7 @@
+@@ -196,7 +198,7 @@ impl Write for Socket {
                  deadline,
              } => {
                  stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
@@ -93,7 +220,7 @@
              }
              Self::Connected {
                  stream,
-@@ -228,7 +229,7 @@
+@@ -228,7 +230,7 @@ impl Write for Socket {
                  deadline,
              } => {
                  stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
