@@ -1,0 +1,76 @@
+name: relay hang experiment
+
+on:
+  push:
+    branches: [relay-hang-experiment]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: full
+  RELAY_BASELINE_REPETITIONS: '20'
+  RELAY_OTHER_REPETITIONS: '10'
+  RELAY_WATCHDOG_SECONDS: '30'
+  RELAY_DUMP_TIMEOUT_SECONDS: '15'
+  RELAY_MAX_DUMPS: '2'
+  RELAY_RUN_BUDGET_SECONDS: '720'
+
+jobs:
+  investigate:
+    if: github.repository == 'karalabe/darkbio-cli'
+    name: ${{ matrix.variant }} / ${{ matrix.shard }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        include:
+          - {variant: baseline, shard: '01'}
+          - {variant: baseline, shard: '02'}
+          - {variant: baseline, shard: '03'}
+          - {variant: baseline, shard: '04'}
+          - {variant: baseline, shard: '05'}
+          - {variant: baseline, shard: '06'}
+          - {variant: baseline, shard: '07'}
+          - {variant: baseline, shard: '08'}
+          - {variant: baseline, shard: '09'}
+          - {variant: baseline, shard: '10'}
+          - {variant: traced, shard: '01'}
+          - {variant: guarded, shard: '01'}
+    env:
+      RELAY_VARIANT: ${{ matrix.variant }}
+      RELAY_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare and build this branch
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          & ./.github/relay-hang/run-windows.ps1 -Stage Prepare `
+            -Repository $env:GITHUB_WORKSPACE `
+            -Evidence "$env:RUNNER_TEMP/relay-evidence" `
+            -TargetDirectory "$env:RUNNER_TEMP/relay-target"
+
+      - name: Repeat the complete connect binary
+        timeout-minutes: 13
+        shell: pwsh
+        run: |
+          & ./.github/relay-hang/run-windows.ps1 -Stage Run `
+            -Repository $env:GITHUB_WORKSPACE `
+            -Evidence "$env:RUNNER_TEMP/relay-evidence" `
+            -TargetDirectory "$env:RUNNER_TEMP/relay-target"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: relay-${{ matrix.variant }}-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/relay-evidence
+          if-no-files-found: warn
+          retention-days: 7
