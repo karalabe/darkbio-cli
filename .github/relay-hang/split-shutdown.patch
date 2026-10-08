@@ -1,15 +1,12 @@
 --- a/connect/src/cloud/relay.rs
 +++ b/connect/src/cloud/relay.rs
-@@ -395,7 +395,11 @@
+@@ -393,7 +393,8 @@
+     /// partly written frame.
+     fn shutdown(&self) {
          if let Some(socket) = &self.socket {
-             #[cfg(test)]
-             super::socket::trace_socket("shutdown enter", socket, ());
--            let result = socket.shutdown(Shutdown::Both);
-+            let sent = socket.shutdown(Shutdown::Write);
-+            #[cfg(test)]
-+            super::socket::trace_socket("shutdown write exit", socket, &sent);
-+            let _ = sent;
-+            let result = socket.shutdown(Shutdown::Read);
-             #[cfg(test)]
-             super::socket::trace_socket("shutdown exit", socket, &result);
-             let _ = result;
+-            let _ = socket.shutdown(Shutdown::Both);
++            let _ = socket.shutdown(Shutdown::Write);
++            let _ = socket.shutdown(Shutdown::Read);
+         }
+     }
+ }

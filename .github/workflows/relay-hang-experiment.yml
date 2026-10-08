@@ -10,8 +10,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: full
-  RELAY_BASELINE_REPETITIONS: '20'
-  RELAY_OTHER_REPETITIONS: '20'
+  RELAY_BASELINE_REPETITIONS: '30'
+  RELAY_OTHER_REPETITIONS: '30'
   RELAY_WATCHDOG_SECONDS: '30'
   RELAY_DUMP_TIMEOUT_SECONDS: '15'
   RELAY_MAX_DUMPS: '2'
@@ -30,16 +30,16 @@ jobs:
         include:
           - {variant: baseline, shard: '01'}
           - {variant: baseline, shard: '02'}
-          - {variant: traced, shard: '01'}
-          - {variant: traced, shard: '02'}
-          - {variant: traced, shard: '03'}
-          - {variant: traced, shard: '04'}
           - {variant: shared-handle, shard: '01'}
           - {variant: shared-handle, shard: '02'}
           - {variant: split-shutdown, shard: '01'}
           - {variant: split-shutdown, shard: '02'}
-          - {variant: peer-fenced, shard: '01'}
-          - {variant: peer-fenced, shard: '02'}
+          - {variant: buffered, shard: '01'}
+          - {variant: buffered, shard: '02'}
+          - {variant: worker-after-shutdown, shard: '01'}
+          - {variant: worker-after-shutdown, shard: '02'}
+          - {variant: server-after-shutdown, shard: '01'}
+          - {variant: server-after-shutdown, shard: '02'}
     env:
       RELAY_VARIANT: ${{ matrix.variant }}
       RELAY_SHARD: ${{ matrix.shard }}
@@ -47,6 +47,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Prepare and build this branch
         timeout-minutes: 6

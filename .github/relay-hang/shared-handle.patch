@@ -1,3 +1,43 @@
+--- a/connect/src/cloud/mod.rs
++++ b/connect/src/cloud/mod.rs
+@@ -352,7 +352,7 @@
+         &self,
+         requester: &Requester,
+         timing: Timing,
+-        connected: &dyn Fn(&std::net::TcpStream) -> Result<(), Failure>,
++        connected: &dyn Fn(&Arc<std::net::TcpStream>) -> Result<(), Failure>,
+     ) -> Result<socket::Connection, Failure> {
+         let cloud = self.cloud.as_ref().expect("cloud route available");
+         self.authenticate(requester, timing, || {
+--- a/connect/src/cloud/relay.rs
++++ b/connect/src/cloud/relay.rs
+@@ -156,7 +156,7 @@
+     /// Whether the queue's first frame is partly written to the socket.
+     writing: bool,
+     /// Handle that shuts the current socket down, set once its TCP connects.
+-    socket: Option<TcpStream>,
++    socket: Option<Arc<TcpStream>>,
+     /// Whether the current socket finished its upgrade.
+     connected: bool,
+     /// Whether a join succeeded, which keeps the relay joined for the session.
+@@ -435,7 +435,7 @@
+     /// starts.
+     ///
+     /// A closed relay or a passed join deadline abandons the socket instead.
+-    fn socket(&self, socket: &TcpStream) -> Result<(), Failure> {
++    fn socket(&self, socket: &Arc<TcpStream>) -> Result<(), Failure> {
+         let mut state = self.state.lock().expect("relay state not poisoned");
+         if state.closed {
+             return Err(protocol::Error::Closed.into());
+@@ -447,7 +447,7 @@
+         {
+             return Err(protocol::Error::Timeout.into());
+         }
+-        state.socket = Some(socket.try_clone().map_err(io_error)?);
++        state.socket = Some(socket.clone());
+         Ok(())
+     }
+ 
 --- a/connect/src/cloud/socket.rs
 +++ b/connect/src/cloud/socket.rs
 @@ -13,6 +13,7 @@
@@ -15,9 +55,9 @@
 -type OnConnect<'a> = &'a dyn Fn(&TcpStream) -> Result<(), Failure>;
 +type OnConnect<'a> = &'a dyn Fn(&Arc<TcpStream>) -> Result<(), Failure>;
  
- /// Prints test-only syscall and coordination events without frame contents.
- #[cfg(test)]
-@@ -126,7 +127,7 @@
+ /// Opens a cloud socket that must agree on the requested subprotocol, carrying
+ /// the Ark's `auth` proof in the upgrade.
+@@ -93,7 +94,7 @@
              Err(error) => failure = error,
          }
      }
@@ -25,8 +65,8 @@
 +    let stream = Arc::new(connected.ok_or_else(|| io_error(failure))?);
      stream.set_nodelay(true).map_err(io_error)?;
      if let Some(on_connect) = on_connect {
-         #[cfg(test)]
-@@ -190,7 +191,7 @@
+         on_connect(&stream)?;
+@@ -153,7 +154,7 @@
          /// Clock of the connection, which the deadline is measured on.
          clock: Clock,
          /// Connected TCP socket, optionally wrapped by TLS above this adapter.
@@ -35,25 +75,25 @@
          /// Absolute bound, turned into a fresh timeout before each blocking I/O.
          deadline: Instant,
      },
-@@ -223,7 +224,7 @@
-                 result?;
-                 #[cfg(test)]
-                 trace_socket("read enter", stream, ());
--                let result = stream.read(bytes);
-+                let result = stream.as_ref().read(bytes);
-                 #[cfg(test)]
-                 trace_socket("read exit", stream, &result);
-                 result
-@@ -252,7 +253,7 @@
-                 result?;
-                 #[cfg(test)]
-                 trace_socket("write enter", stream, ());
--                let result = stream.write(bytes);
-+                let result = stream.as_ref().write(bytes);
-                 #[cfg(test)]
-                 trace_socket("write exit", stream, &result);
-                 result
-@@ -287,7 +288,7 @@
+@@ -178,7 +179,7 @@
+                 deadline,
+             } => {
+                 stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
+-                stream.read(bytes)
++                stream.as_ref().read(bytes)
+             }
+             Self::Connected { stream, .. } => stream.read(bytes),
+         }
+@@ -196,7 +197,7 @@
+                 deadline,
+             } => {
+                 stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
+-                stream.write(bytes)
++                stream.as_ref().write(bytes)
+             }
+             Self::Connected {
+                 stream,
+@@ -228,7 +229,7 @@
                  deadline,
              } => {
                  stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
@@ -62,43 +102,3 @@
              }
              Self::Connected { stream, .. } => stream.flush(),
          }
---- a/connect/src/cloud/relay.rs
-+++ b/connect/src/cloud/relay.rs
-@@ -156,7 +156,7 @@
-     /// Whether the queue's first frame is partly written to the socket.
-     writing: bool,
-     /// Handle that shuts the current socket down, set once its TCP connects.
--    socket: Option<TcpStream>,
-+    socket: Option<Arc<TcpStream>>,
-     /// Whether the current socket finished its upgrade.
-     connected: bool,
-     /// Whether a join succeeded, which keeps the relay joined for the session.
-@@ -447,7 +447,7 @@
-     /// starts.
-     ///
-     /// A closed relay or a passed join deadline abandons the socket instead.
--    fn socket(&self, socket: &TcpStream) -> Result<(), Failure> {
-+    fn socket(&self, socket: &Arc<TcpStream>) -> Result<(), Failure> {
-         let mut state = self.state.lock().expect("relay state not poisoned");
-         if state.closed {
-             return Err(protocol::Error::Closed.into());
-@@ -459,7 +459,7 @@
-         {
-             return Err(protocol::Error::Timeout.into());
-         }
--        state.socket = Some(socket.try_clone().map_err(io_error)?);
-+        state.socket = Some(socket.clone());
-         #[cfg(test)]
-         super::socket::trace_socket("control installed", state.socket.as_ref().unwrap(), ());
-         Ok(())
---- a/connect/src/cloud/mod.rs
-+++ b/connect/src/cloud/mod.rs
-@@ -352,7 +352,7 @@
-         &self,
-         requester: &Requester,
-         timing: Timing,
--        connected: &dyn Fn(&std::net::TcpStream) -> Result<(), Failure>,
-+        connected: &dyn Fn(&Arc<std::net::TcpStream>) -> Result<(), Failure>,
-     ) -> Result<socket::Connection, Failure> {
-         let cloud = self.cloud.as_ref().expect("cloud route available");
-         self.authenticate(requester, timing, || {

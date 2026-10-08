@@ -1,0 +1,645 @@
+--- a/connect/src/cloud/mod.rs
++++ b/connect/src/cloud/mod.rs
+@@ -19,6 +19,8 @@
+ mod pairing;
+ pub use pairing::PairingProgress;
+ mod relay;
++#[cfg(test)]
++mod relay_probe;
+ mod socket;
+ 
+ pub use auth::CloudAuth;
+--- a/connect/src/cloud/relay.rs
++++ b/connect/src/cloud/relay.rs
+@@ -157,6 +157,9 @@
+     writing: bool,
+     /// Handle that shuts the current socket down, set once its TCP connects.
+     socket: Option<TcpStream>,
++    /// In-memory observations for the selected first upgrade.
++    #[cfg(test)]
++    probe: Option<&'static super::relay_probe::Probe>,
+     /// Whether the current socket finished its upgrade.
+     connected: bool,
+     /// Whether a join succeeded, which keeps the relay joined for the session.
+@@ -204,6 +207,8 @@
+             bytes: 0,
+             writing: false,
+             socket: None,
++            #[cfg(test)]
++            probe: None,
+             connected: false,
+             wanted: false,
+             kick: false,
+@@ -393,7 +398,16 @@
+     /// partly written frame.
+     fn shutdown(&self) {
+         if let Some(socket) = &self.socket {
+-            let _ = socket.shutdown(Shutdown::Both);
++            #[cfg(test)]
++            if let Some(probe) = self.probe {
++                probe.record(1, super::relay_probe::Event::ShutdownEnter, 0);
++            }
++            let result = socket.shutdown(Shutdown::Both);
++            #[cfg(test)]
++            if let Some(probe) = self.probe {
++                probe.shutdown_finished(&result);
++            }
++            let _ = result;
+         }
+     }
+ }
+@@ -448,6 +462,10 @@
+             return Err(protocol::Error::Timeout.into());
+         }
+         state.socket = Some(socket.try_clone().map_err(io_error)?);
++        #[cfg(test)]
++        {
++            state.probe = super::relay_probe::bind(socket, state.socket.as_ref().unwrap());
++        }
+         Ok(())
+     }
+ 
+@@ -622,9 +640,12 @@
+             if refresh {
+                 services.ensure(&requester, super::Step::Refresh, Timing::until(deadline))?;
+             }
+-            let socket = services.join(&requester, Timing::until(deadline), &|socket| {
++            let result = services.join(&requester, Timing::until(deadline), &|socket| {
+                 shared.socket(socket)
+-            })?;
++            });
++            #[cfg(test)]
++            super::relay_probe::joined(result.is_ok());
++            let socket = result?;
+             drop(services);
+             ready(socket, &poll, &shared)
+         })();
+@@ -726,6 +747,10 @@
+     let mut state = shared.state.lock().expect("relay state not poisoned");
+     state.shutdown();
+     state.socket = None;
++    #[cfg(test)]
++    {
++        state.probe = None;
++    }
+     state.connected = false;
+     state.joining = None;
+     state.inbound = None;
+@@ -1622,13 +1647,17 @@
+         let mut tester = test_clock();
+         let clock = tester.clock();
+         let (listener, url) = cloud();
++        let probe = super::super::relay_probe::arm(1, &listener);
+         let (stalled, stalls) = mpsc::channel();
+         let (done, finish) = mpsc::channel();
+         let server = thread::spawn(move || {
+             let mut stream = accept(&listener);
+             headers(&mut stream);
++            probe.record(2, super::super::relay_probe::Event::HeadersDone, 0);
++            probe.record(2, super::super::relay_probe::Event::SignalEnter, 0);
+             stalled.send(()).unwrap();
+-            assert_stream_closed(stream.read(&mut [0]));
++            probe.record(2, super::super::relay_probe::Event::SignalExit, 0);
++            assert_stream_closed(probe.server_read(&mut stream));
+             sync(&listener);
+             let mut socket = upgrade(accept(&listener));
+             assert_eq!(frame(&mut socket), [2]);
+@@ -1646,8 +1675,10 @@
+         *shared.rearming.lock().unwrap() = Some((rearming, resumed));
+         shared.signal();
+         paused.recv().unwrap();
++        probe.record(3, super::super::relay_probe::Event::Trigger, 0);
+         tester.advance(Duration::from_secs(10));
+         resume.send(()).unwrap();
++        probe.record(3, super::super::relay_probe::Event::TriggerDone, 0);
+         assert!(refused(sent).contains("10 s"));
+         while !shared.state.lock().unwrap().unsynced {
+             thread::yield_now();
+@@ -1794,13 +1825,17 @@
+         let mut tester = test_clock();
+         let clock = tester.clock();
+         let (listener, url) = cloud();
++        let probe = super::super::relay_probe::arm(2, &listener);
+         let (stalled, stalls) = mpsc::channel();
+         let server = thread::spawn(move || {
+             sync(&listener);
+             let mut stream = accept(&listener);
+             headers(&mut stream);
++            probe.record(2, super::super::relay_probe::Event::HeadersDone, 0);
++            probe.record(2, super::super::relay_probe::Event::SignalEnter, 0);
+             stalled.send(()).unwrap();
+-            assert_stream_closed(stream.read(&mut [0]));
++            probe.record(2, super::super::relay_probe::Event::SignalExit, 0);
++            assert_stream_closed(probe.server_read(&mut stream));
+         });
+         let fixture = Fixture::new(&clock, url);
+         let sent = fixture.outbound(vec![1]);
+@@ -1823,7 +1858,9 @@
+         fixture.join();
+         stalls.recv().unwrap();
+         tester.wait_timers(1);
++        probe.record(3, super::super::relay_probe::Event::Trigger, 0);
+         tester.advance(Duration::from_secs(10));
++        probe.record(3, super::super::relay_probe::Event::TriggerDone, 0);
+         assert_eq!(refused(sent), UNSENT);
+         assert!(
+             matches!(fixture.notices.recv().unwrap(), RelayNotice::Failed(cause) if cause == UNSENT)
+@@ -2166,18 +2203,24 @@
+     fn test_close_during_join() {
+         let clock = test_clock().clock();
+         let (listener, url) = cloud();
++        let probe = super::super::relay_probe::arm(0, &listener);
+         let (stalled, stalls) = mpsc::channel();
+         let server = thread::spawn(move || {
+             let mut stream = accept(&listener);
+             headers(&mut stream);
++            probe.record(2, super::super::relay_probe::Event::HeadersDone, 0);
++            probe.record(2, super::super::relay_probe::Event::SignalEnter, 0);
+             stalled.send(()).unwrap();
+-            assert_stream_closed(stream.read(&mut [0]));
++            probe.record(2, super::super::relay_probe::Event::SignalExit, 0);
++            assert_stream_closed(probe.server_read(&mut stream));
+         });
+         let fixture = Fixture::new(&clock, url);
+         let sent = fixture.outbound(vec![1]);
+         fixture.join();
+         stalls.recv().unwrap();
++        probe.record(3, super::super::relay_probe::Event::Trigger, 0);
+         fixture.services.close();
++        probe.record(3, super::super::relay_probe::Event::TriggerDone, 0);
+         assert!(refused(sent).contains("closed"));
+         server.join().unwrap();
+     }
+--- /dev/null
++++ b/connect/src/cloud/relay_probe.rs
+@@ -0,0 +1,360 @@
++// connect-rs: client library for Ark enclaves
++// Copyright 2026 Dark Bio AG. All rights reserved.
++//
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//! Bounded, in-memory observations of three stalled relay upgrades.
++//!
++//! Each actor writes a separate fixed buffer. The critical path performs no
++//! allocation, formatting, file I/O, socket query or shared mutex acquisition.
++//! Timestamps bracket Rust calls, not entry into the Windows kernel.
++//! Output starts only after all three server reads and worker joins finish,
++//! and all three first shutdown calls return. A hung test can therefore leave
++//! evidence before its harness watchdog fires. Earlier hangs retain the static
++//! buffers in the process dump.
++
++#![allow(clippy::disallowed_methods)] // real time measures and bounds OS experiments
++
++use std::cell::Cell;
++use std::io::{self, Read, Write};
++use std::net::{TcpListener, TcpStream};
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
++use std::time::{Duration, Instant};
++
++/// Common timestamp origin, initialized before any target socket connects.
++static START: OnceLock<Instant> = OnceLock::new();
++/// One slot per test, claimed only by its first relay TCP connection.
++static PROBES: [Probe; 3] = [const { Probe::new() }; 3];
++/// Whether the completed observations have been exported.
++static EXPORTED: AtomicBool = AtomicBool::new(false);
++
++thread_local! {
++    /// Probe belonging to the relay worker's current join.
++    static CURRENT: Cell<Option<&'static Probe>> = const { Cell::new(None) };
++}
++
++/// Events stored without constructing strings during the observed operations.
++#[derive(Clone, Copy, Debug)]
++#[repr(usize)]
++pub(super) enum Event {
++    /// Original and control handles have been associated.
++    Installed = 1,
++    /// Remaining read deadline is being computed.
++    ReadDeadline,
++    /// Remaining deadline computation failed.
++    ReadDeadlineError,
++    /// Read timeout is about to be set, in nanoseconds.
++    ReadTimeoutEnter,
++    /// Read timeout configuration returned.
++    ReadTimeoutExit,
++    /// Worker receive is about to start.
++    ReadEnter,
++    /// Worker receive returned.
++    ReadExit,
++    /// Write timeout is about to be set, in nanoseconds.
++    WriteTimeoutEnter,
++    /// Write timeout configuration returned.
++    WriteTimeoutExit,
++    /// Worker send is about to start.
++    WriteEnter,
++    /// Worker send returned.
++    WriteExit,
++    /// Combined shutdown is about to start.
++    ShutdownEnter,
++    /// Combined shutdown returned.
++    ShutdownExit,
++    /// Server has consumed the upgrade request.
++    HeadersDone,
++    /// Server is about to notify the test that the upgrade has stalled.
++    SignalEnter,
++    /// Server's notification send returned.
++    SignalExit,
++    /// Server receive is about to start.
++    ServerReadEnter,
++    /// Server receive returned.
++    ServerReadExit,
++    /// Worker join returned, with one for success and zero for failure.
++    JoinExit,
++    /// Test is about to close the relay or advance its clock.
++    Trigger,
++    /// Test close or clock advancement returned.
++    TriggerDone,
++    /// A forced-order gate is waiting for shutdown to return.
++    GateEnter,
++    /// A forced-order gate completed, with one for success and zero for timeout.
++    GateExit,
++    /// Flush deadline is about to be computed.
++    FlushDeadline,
++    /// Flush timeout is about to be set, in nanoseconds.
++    FlushTimeoutEnter,
++    /// Flush timeout configuration returned.
++    FlushTimeoutExit,
++}
++
++/// One published record, containing only primitive values.
++#[derive(Debug)]
++struct Record {
++    /// Timestamp in nanoseconds since the common origin.
++    ns: AtomicU64,
++    /// Result, byte count or timeout supplied by this event.
++    value: AtomicI64,
++    /// Event discriminant, published last; zero means incomplete.
++    event: AtomicUsize,
++}
++
++impl Record {
++    /// Creates an empty record.
++    const fn new() -> Self {
++        Self {
++            ns: AtomicU64::new(0),
++            value: AtomicI64::new(0),
++            event: AtomicUsize::new(0),
++        }
++    }
++}
++
++/// Separate cache lines for the worker, shutdown, server and test writers.
++#[derive(Debug)]
++#[repr(align(128))]
++struct Lane {
++    /// Number of reserved records, including any overflow.
++    used: AtomicUsize,
++    /// Bounded storage that survives a stopped process.
++    records: [Record; 64],
++}
++
++impl Lane {
++    /// Creates a fixed buffer without allocating.
++    const fn new() -> Self {
++        Self {
++            used: AtomicUsize::new(0),
++            records: [const { Record::new() }; 64],
++        }
++    }
++}
++
++/// Identity and observations for one test's first relay connection.
++#[derive(Debug)]
++pub(super) struct Probe {
++    /// Listener port registered before the fixture starts.
++    port: AtomicU16,
++    /// Whether a worker has claimed this test's first socket.
++    claimed: AtomicBool,
++    /// Original socket handle, retained as an identity rather than ownership.
++    client: AtomicU64,
++    /// Clone used by the relay's shutdown.
++    control: AtomicU64,
++    /// Server socket handle.
++    server: AtomicU64,
++    /// Zero for observation, one for worker gate, two for server gate.
++    order: AtomicUsize,
++    /// Whether the first shutdown call has returned.
++    shutdown_done: AtomicBool,
++    /// Whether the server's close observation has returned.
++    server_done: AtomicBool,
++    /// Whether the worker's first join has returned.
++    worker_done: AtomicBool,
++    /// Buffers for worker, shutdown, server and test events.
++    lanes: [Lane; 4],
++}
++
++impl Probe {
++    /// Creates an unarmed observation slot.
++    const fn new() -> Self {
++        Self {
++            port: AtomicU16::new(0),
++            claimed: AtomicBool::new(false),
++            client: AtomicU64::new(0),
++            control: AtomicU64::new(0),
++            server: AtomicU64::new(0),
++            order: AtomicUsize::new(0),
++            shutdown_done: AtomicBool::new(false),
++            server_done: AtomicBool::new(false),
++            worker_done: AtomicBool::new(false),
++            lanes: [const { Lane::new() }; 4],
++        }
++    }
++
++    /// Appends one event without allocating or waiting for another writer.
++    pub(super) fn record(&self, lane: usize, event: Event, value: i64) {
++        let ns = START.get().unwrap().elapsed().as_nanos() as u64;
++        let lane = &self.lanes[lane];
++        let index = lane.used.fetch_add(1, Ordering::Relaxed);
++        if let Some(record) = lane.records.get(index) {
++            record.ns.store(ns, Ordering::Relaxed);
++            record.value.store(value, Ordering::Relaxed);
++            record.event.store(event as usize, Ordering::Release);
++        }
++    }
++
++    /// Publishes the first shutdown result and attempts deferred export.
++    pub(super) fn shutdown_finished(&self, result: &io::Result<()>) {
++        self.record(1, Event::ShutdownExit, outcome(result, |_| 0));
++        self.shutdown_done.store(true, Ordering::Release);
++        export();
++    }
++
++    /// Observes the server's existing read and preserves its original result.
++    pub(super) fn server_read(&self, stream: &mut TcpStream) -> io::Result<usize> {
++        self.server.store(handle(stream), Ordering::Relaxed);
++        self.gate(2, 2);
++        self.record(2, Event::ServerReadEnter, 0);
++        let result = stream.read(&mut [0]);
++        self.record(2, Event::ServerReadExit, outcome(&result, |n| *n as i64));
++        self.server_done.store(true, Ordering::Release);
++        export();
++        result
++    }
++
++    /// Waits at an explicitly selected intervention, bounded by real time.
++    pub(super) fn gate(&self, order: usize, lane: usize) {
++        if self.order.load(Ordering::Relaxed) != order {
++            return;
++        }
++        self.record(lane, Event::GateEnter, 0);
++        let start = Instant::now();
++        while !self.shutdown_done.load(Ordering::Acquire)
++            && start.elapsed() < Duration::from_secs(2)
++        {
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        self.record(
++            lane,
++            Event::GateExit,
++            i64::from(self.shutdown_done.load(Ordering::Acquire)),
++        );
++    }
++}
++
++/// Registers a target listener and chooses a gate before the fixture starts.
++pub(super) fn arm(index: usize, listener: &TcpListener) -> &'static Probe {
++    START.get_or_init(Instant::now);
++    let probe = &PROBES[index];
++    let order = match std::env::var("RELAY_PROBE_ORDER").as_deref() {
++        Ok("worker-after-shutdown") => 1,
++        Ok("server-after-shutdown") => 2,
++        Ok("observe") | Err(_) => 0,
++        _ => panic!("unknown relay probe order"),
++    };
++    probe.order.store(order, Ordering::Relaxed);
++    probe
++        .port
++        .store(listener.local_addr().unwrap().port(), Ordering::Release);
++    probe
++}
++
++/// Associates the first relay socket with its clone before upgrade I/O.
++pub(super) fn bind(client: &TcpStream, control: &TcpStream) -> Option<&'static Probe> {
++    let port = client.peer_addr().ok()?.port();
++    let probe = PROBES.iter().find(|probe| {
++        probe.port.load(Ordering::Acquire) == port
++            && probe
++                .claimed
++                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
++                .is_ok()
++    })?;
++    probe.client.store(handle(client), Ordering::Relaxed);
++    probe.control.store(handle(control), Ordering::Relaxed);
++    probe.record(0, Event::Installed, 0);
++    CURRENT.set(Some(probe));
++    Some(probe)
++}
++
++/// Returns the probe on this worker without querying the socket.
++pub(super) fn current() -> Option<&'static Probe> {
++    CURRENT.get()
++}
++
++/// Ends the worker's first join even when its deadline prevents a receive.
++pub(super) fn joined(ok: bool) {
++    if let Some(probe) = CURRENT.take() {
++        probe.record(0, Event::JoinExit, i64::from(ok));
++        probe.worker_done.store(true, Ordering::Release);
++        export();
++    }
++}
++
++/// Encodes success through its supplied value and errors as negative OS codes.
++///
++/// An error without a native code uses -1. No error message is formatted.
++pub(super) fn outcome<T>(result: &io::Result<T>, value: impl FnOnce(&T) -> i64) -> i64 {
++    match result {
++        Ok(result) => value(result),
++        Err(error) => -i64::from(error.raw_os_error().unwrap_or(1)),
++    }
++}
++
++/// Reads the native handle without inspecting or changing socket state.
++fn handle(socket: &TcpStream) -> u64 {
++    #[cfg(windows)]
++    {
++        std::os::windows::io::AsRawSocket::as_raw_socket(socket) as u64
++    }
++    #[cfg(unix)]
++    {
++        std::os::fd::AsRawFd::as_raw_fd(socket) as u64
++    }
++}
++
++/// Exports only after every observed server read, worker join and shutdown ends.
++fn export() {
++    if !PROBES.iter().all(|probe| {
++        probe.server_done.load(Ordering::Acquire)
++            && probe.worker_done.load(Ordering::Acquire)
++            && probe.shutdown_done.load(Ordering::Acquire)
++    }) || EXPORTED.swap(true, Ordering::AcqRel)
++    {
++        return;
++    }
++
++    // All watched calls have returned; formatting and file I/O start here
++    let result = (|| -> io::Result<()> {
++        let path = std::env::var_os("RELAY_PROBE_FILE")
++            .ok_or_else(|| io::Error::other("RELAY_PROBE_FILE is missing"))?;
++        let mut output = std::io::BufWriter::new(std::fs::File::create(path)?);
++        writeln!(
++            output,
++            "schema=1 units=nanoseconds errors=negative_native_code missing_native_code=-1"
++        )?;
++        writeln!(
++            output,
++            "events=1:installed,2:read_deadline,3:read_deadline_error,4:read_timeout_enter,5:read_timeout_exit,6:read_enter,7:read_exit,8:write_timeout_enter,9:write_timeout_exit,10:write_enter,11:write_exit,12:shutdown_enter,13:shutdown_exit,14:headers_done,15:signal_enter,16:signal_exit,17:server_read_enter,18:server_read_exit,19:join_exit,20:trigger,21:trigger_done,22:gate_enter,23:gate_exit,24:flush_deadline,25:flush_timeout_enter,26:flush_timeout_exit"
++        )?;
++        for (index, probe) in PROBES.iter().enumerate() {
++            writeln!(
++                output,
++                "probe={index} port={} client={} control={} server={} order={}",
++                probe.port.load(Ordering::Relaxed),
++                probe.client.load(Ordering::Relaxed),
++                probe.control.load(Ordering::Relaxed),
++                probe.server.load(Ordering::Relaxed),
++                probe.order.load(Ordering::Relaxed),
++            )?;
++            for (actor, lane) in probe.lanes.iter().enumerate() {
++                let used = lane.used.load(Ordering::Acquire);
++                writeln!(
++                    output,
++                    "probe={index} actor={actor} reserved={used} overflow={}",
++                    used.saturating_sub(lane.records.len())
++                )?;
++                for (sequence, record) in lane.records.iter().take(used).enumerate() {
++                    let event = record.event.load(Ordering::Acquire);
++                    if event != 0 {
++                        writeln!(
++                            output,
++                            "probe={index} actor={actor} sequence={sequence} ns={} event={event} value={}",
++                            record.ns.load(Ordering::Relaxed),
++                            record.value.load(Ordering::Relaxed),
++                        )?;
++                    }
++                }
++            }
++        }
++        output.flush()
++    })();
++    if let Err(error) = result {
++        panic!("could not export completed relay observations: {error}");
++    }
++}
+--- a/connect/src/cloud/socket.rs
++++ b/connect/src/cloud/socket.rs
+@@ -7,6 +7,8 @@
+ //! Authenticated cloud sockets with blocking deadlines and relay readiness.
+ 
+ use super::{Failure, http::Api};
++#[cfg(test)]
++use super::relay_probe::{self, Event, outcome};
+ use crate::timing::ClockExt;
+ use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+ use darkbio_clock::Clock;
+@@ -177,8 +179,39 @@
+                 stream,
+                 deadline,
+             } => {
+-                stream.set_read_timeout(Some(clock.remaining(*deadline)?))?;
+-                stream.read(bytes)
++                #[cfg(test)]
++                let probe = relay_probe::current();
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::ReadDeadline, 0);
++                }
++                let left = clock.remaining(*deadline);
++                #[cfg(test)]
++                if let (Some(probe), Err(_)) = (probe, &left) {
++                    probe.record(0, Event::ReadDeadlineError, outcome(&left, |_| 0));
++                }
++                let left = left?;
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::ReadTimeoutEnter, left.as_nanos() as i64);
++                }
++                let result = stream.set_read_timeout(Some(left));
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::ReadTimeoutExit, outcome(&result, |_| 0));
++                }
++                result?;
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.gate(1, 0);
++                    probe.record(0, Event::ReadEnter, 0);
++                }
++                let result = stream.read(bytes);
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::ReadExit, outcome(&result, |n| *n as i64));
++                }
++                result
+             }
+             Self::Connected { stream, .. } => stream.read(bytes),
+         }
+@@ -195,8 +228,29 @@
+                 stream,
+                 deadline,
+             } => {
+-                stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
+-                stream.write(bytes)
++                let left = clock.remaining(*deadline)?;
++                #[cfg(test)]
++                let probe = relay_probe::current();
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::WriteTimeoutEnter, left.as_nanos() as i64);
++                }
++                let result = stream.set_write_timeout(Some(left));
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::WriteTimeoutExit, outcome(&result, |_| 0));
++                }
++                result?;
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::WriteEnter, 0);
++                }
++                let result = stream.write(bytes);
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::WriteExit, outcome(&result, |n| *n as i64));
++                }
++                result
+             }
+             Self::Connected {
+                 stream,
+@@ -227,7 +281,23 @@
+                 stream,
+                 deadline,
+             } => {
+-                stream.set_write_timeout(Some(clock.remaining(*deadline)?))?;
++                #[cfg(test)]
++                let probe = relay_probe::current();
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::FlushDeadline, 0);
++                }
++                let left = clock.remaining(*deadline)?;
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::FlushTimeoutEnter, left.as_nanos() as i64);
++                }
++                let result = stream.set_write_timeout(Some(left));
++                #[cfg(test)]
++                if let Some(probe) = probe {
++                    probe.record(0, Event::FlushTimeoutExit, outcome(&result, |_| 0));
++                }
++                result?;
+                 stream.flush()
+             }
+             Self::Connected { stream, .. } => stream.flush(),

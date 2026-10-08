@@ -3,15 +3,45 @@
 Builds and repeats this branch's connect tests with bounded failure capture.
 .DESCRIPTION
 The workflow sets variant, repetitions, watchdogs and dump limits through RELAY_*
-environment variables. Baseline uses unchanged source. Traced writes syscall
-events to a per-run file. Shared-handle and split-shutdown layer one change each
-over that trace. Peer-fenced changes only the two Ark tests' teardown ordering.
-Guarded remains available for manual use. All runs use --nocapture and libtest's
+environment variables. Baseline uses unchanged source. Shared-handle and
+split-shutdown each apply one standalone patch to 5f5323c, without probes.
+Buffered records three stalled upgrades in fixed memory buffers. The two
+after-shutdown variants use the same probes and gate one side's first receive
+until shutdown returns, bounded by 2 s of real time.
+All runs use --nocapture and libtest's
 default thread count. Failures and hangs do not stop later repetitions.
 
 Each run writes run-NNN.stdout, run-NNN.stderr and run-NNN.status.json. The timeline
 JSONL timestamps output chunks when observed by the harness, with polling and
-scheduling delay. Traced variants also write run-NNN.trace at the event source.
+scheduling delay. Buffered variants write run-NNN.probe only after all three
+observed server reads, worker joins and initial shutdown calls have returned.
+Earlier hangs retain the static buffers in the existing process dump.
+Probe slots 0, 1 and 2 are close_during_join, hold_deadline and stalled_join_cause.
+Actors 0, 1, 2 and 3 are worker, shutdown, server and test. The probe header maps
+event numbers to names. Sort records by ns to compare actors. Timestamps bracket
+Rust calls, not kernel entry. Negative values are native errors, with -1 for an
+error without a native code; receive successes carry byte counts.
+
+Run 4 schedules 30 complete binary runs in each of two shards per variant.
+The baseline measures the failure rate without probes. Shared-handle removes
+only the blocking stream's duplicated shutdown handle. Split-shutdown changes
+only the shutdown call sequence. These variants contain no memory probes.
+Buffered keeps the original shutdown behavior and records results in memory.
+Worker-after-shutdown gates the native worker read after its timeout is set.
+Server-after-shutdown gates the server read after its stalled notification.
+A gate records whether its 2 s wait succeeded. If a deadline prevents a worker
+read, join_exit and read_deadline_error record that path instead.
+
+Compare buffered failures with baseline before interpreting the gated arms.
+A trigger without timely shutdown suggests application scheduling or locking.
+A failed shutdown identifies its native error. A successful shutdown followed
+by server timeout narrows the failure to the socket/receive path; user-space
+events alone do not prove whether TCP emitted a FIN. Compare the two ordered
+arms to isolate receive/shutdown overlap on each endpoint. Zero failures in an
+instrumented arm are inconclusive if its probes suppress baseline failures.
+No short SO_RCVTIMEO retry loop is tested, since Windows considers a connection
+indeterminate after a blocking receive timeout.
+
 Output is forwarded to the Actions log while the test runs. A watchdog expiry records
 outcome timeout, captures a dump up to RELAY_MAX_DUMPS times per job, and kills
 the process tree. A returned nonzero exit records outcome failed. A server panic
@@ -35,7 +65,8 @@ Set-StrictMode -Version Latest
 
 # Validate the workflow settings before launching any process
 $variant = $env:RELAY_VARIANT
-if ($variant -notin @('baseline', 'traced', 'guarded', 'shared-handle', 'split-shutdown', 'peer-fenced')) {
+if ($variant -notin @('baseline', 'shared-handle', 'split-shutdown', 'buffered',
+    'worker-after-shutdown', 'server-after-shutdown')) {
     throw 'Unsupported RELAY_VARIANT'
 }
 $repetitions = if ($variant -eq 'baseline') {
@@ -164,23 +195,26 @@ if ($Stage -eq 'Prepare') {
         runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $evidenceFolder 'subject.json') -Encoding utf8
 
-    # Only diagnostic variants change the checked-out source before building
+    # Each variant starts from the unchanged source at the fixed baseline
+    & git diff --exit-code 5f5323c -- . ':!.github/relay-hang' ':!.github/workflows/relay-hang-experiment.yml'
+    if ($LASTEXITCODE -ne 0) { throw 'Source does not match the 5f5323c baseline' }
     $patches = switch ($variant) {
         'baseline' { @() }
-        'traced' { @('trace.patch') }
-        'guarded' { @('test-lifecycle.patch') }
-        'shared-handle' { @('trace.patch', 'shared-handle.patch') }
-        'split-shutdown' { @('trace.patch', 'split-shutdown.patch') }
-        'peer-fenced' { @('peer-fenced.patch') }
+        'shared-handle' { @('shared-handle.patch') }
+        'split-shutdown' { @('split-shutdown.patch') }
+        'buffered' { @('buffered.patch') }
+        'worker-after-shutdown' { @('buffered.patch') }
+        'server-after-shutdown' { @('buffered.patch') }
     }
     foreach ($patchName in $patches) {
         $patchFile = Join-Path $PSScriptRoot $patchName
-        & git apply --check $patchFile
+        & git apply --index --check $patchFile
         if ($LASTEXITCODE -ne 0) { throw "Cannot apply $patchName to this branch" }
-        & git apply $patchFile
+        & git apply --index $patchFile
         if ($LASTEXITCODE -ne 0) { throw "Could not apply $patchName" }
+        Copy-Item -LiteralPath $patchFile -Destination $evidenceFolder
     }
-    & git diff --no-ext-diff | Out-File (Join-Path $evidenceFolder 'applied.patch') -Encoding utf8
+    & git diff HEAD --no-ext-diff | Out-File (Join-Path $evidenceFolder 'applied.patch') -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw 'Could not record the applied patch' }
 
     # Obtain the dump utility before testing so a hang can be captured immediately
@@ -230,10 +264,16 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
     $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
     $timeline = [System.IO.StreamWriter]::new("$stem.timeline.jsonl", $false)
     $timeline.AutoFlush = $true
-    $env:RELAY_TRACE_FILE = "$stem.trace"
+    $env:RELAY_PROBE_FILE = "$stem.probe"
+    $env:RELAY_PROBE_ORDER = switch ($variant) {
+        'worker-after-shutdown' { 'worker-after-shutdown' }
+        'server-after-shutdown' { 'server-after-shutdown' }
+        default { 'observe' }
+    }
     $record = [ordered]@{
         iteration = $iteration; outcome = 'harness_error'; exit_code = $null
         process_id = $null
+        probe_file = 'not_applicable'
         started_utc = [DateTime]::UtcNow.ToString('o'); elapsed_seconds = 0.0
         watchdog_seconds = $watchdogSeconds; dump_status = 'not_needed'; error = $null
     }
@@ -280,6 +320,13 @@ for ($iteration = 1; $iteration -le $repetitions; $iteration++) {
         if ($null -ne $stderr) { $stderr.Dispose() }
         if ($null -ne $process) { $process.Dispose() }
         $elapsed.Stop()
+        if ($variant -in @('buffered', 'worker-after-shutdown', 'server-after-shutdown')) {
+            $record.probe_file = if (Test-Path -LiteralPath "$stem.probe" -PathType Leaf) {
+                'present'
+            } else {
+                'missing'
+            }
+        }
         $record.elapsed_seconds = [Math]::Round($elapsed.Elapsed.TotalSeconds, 3)
         $record | ConvertTo-Json | Set-Content -LiteralPath "$stem.status.json" -Encoding utf8
         $results.Add([pscustomobject]$record)
