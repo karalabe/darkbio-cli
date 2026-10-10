@@ -89,6 +89,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
         version,
         dry_run,
         no_wait,
+        yes,
     } = command
     else {
         unreachable!()
@@ -131,7 +132,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
             package::headline(&target.summary)
         ),
     );
-    if !context.options.yes
+    if !yes
         && (!context.interactive()
             || !context.confirm(
                 &format!("Install {} and reboot the Ark?", target.version),
@@ -176,7 +177,7 @@ pub(crate) fn run(context: &Context, command: args::Firmware) -> Result<(), Erro
                     .event("approve", "firmware update (Ark Companion on your phone)"),
                 Some(Approval::Button) => context
                     .output
-                    .event("approve", "firmware update (press the button on the Ark)"),
+                    .event("approve", "firmware update (press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED)"),
                 None => context.output.event(
                     "note",
                     "if requested, approve the update on your phone or press the Ark's button",

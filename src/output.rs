@@ -194,6 +194,18 @@ impl Output {
         self.document_with(value, |theme| human::document(theme, value))
     }
 
+    /// Emits preformatted text as the sole result, even in JSON mode.
+    ///
+    /// A failed write claims the result too, so no error document follows text
+    /// that may already have reached stdout.
+    pub fn text(&self, text: &str) -> Result<(), Error> {
+        let _result = self.0.result.lock().expect("output not poisoned");
+        if self.0.printed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.write_result(text.trim_end_matches('\n'))
+    }
+
     /// Emits the sole result, invoking the custom renderer only for human stdout.
     ///
     /// Later result attempts are ignored, including after an earlier write failed.

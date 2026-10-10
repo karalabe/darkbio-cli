@@ -13,6 +13,11 @@ use std::sync::Mutex;
 /// Lock that keeps the tests' `ark` processes from running at the same time.
 static PROCESS: Mutex<()> = Mutex::new(());
 
+/// Public topics in the order the root page advertises them.
+const TOPICS: [&str; 6] = [
+    "agents", "devices", "datasets", "apps", "firmware", "output",
+];
+
 /// Runs the `ark` binary with `args` under the process lock, without color and
 /// with release lookups off.
 fn ark(args: &[&str]) -> Output {
@@ -23,6 +28,49 @@ fn ark(args: &[&str]) -> Output {
         .env("CI", "1")
         .output()
         .unwrap()
+}
+
+/// Checks that every help route reports a failed stdout write as local I/O,
+/// retaining text output and the selected error-event format.
+#[cfg(unix)]
+#[test]
+fn test_help_write_failures_return_local_errors() {
+    let _process = PROCESS.lock().unwrap();
+    for args in [
+        &[][..],
+        &["-h"],
+        &["--help"],
+        &["--help", "--all"],
+        &["help"],
+        &["help", "--all"],
+        &["help", "agents"],
+        &["help", "data", "upload"],
+        &["data", "upload", "-h"],
+        &["data", "upload", "--help"],
+    ] {
+        for json in [false, true] {
+            // Close the reader before starting the child, so the first write
+            // fails without depending on another process's scheduling
+            let (reader, stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(reader);
+            let stdout: std::os::fd::OwnedFd = stdout.into();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ark"));
+            command.args(args).env("NO_COLOR", "1").env("CI", "1");
+            if json {
+                command.arg("--json");
+            }
+            let output = command.stdout(stdout).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{args:?}, json={json}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            if json {
+                let event: Value = serde_json::from_str(&stderr).unwrap();
+                assert_eq!(event["event"], "error", "{args:?}");
+                assert_eq!(event["error"]["code"], "io", "{args:?}");
+            } else {
+                assert!(stderr.starts_with("error[io]:"), "{args:?}: {stderr}");
+            }
+        }
+    }
 }
 
 /// Checks that the private update entry point does nothing and prints nothing
@@ -196,16 +244,18 @@ fn commands() -> Vec<(Vec<String>, String)> {
         let output = ark(&args);
         assert!(output.status.success(), "{args:?}: {output:?}");
         let page = String::from_utf8(output.stdout).unwrap();
-        for line in page
+        let children: Vec<_> = page
             .lines()
             .skip_while(|line| *line != "Commands:")
             .skip(1)
             .take_while(|line| line.starts_with("  "))
-        {
-            let mut child = path.clone();
-            child.push(line.split_whitespace().next().unwrap().to_string());
-            pending.push(child);
-        }
+            .map(|line| {
+                let mut child = path.clone();
+                child.push(line.split_whitespace().next().unwrap().to_string());
+                child
+            })
+            .collect();
+        pending.extend(children.into_iter().rev());
         commands.push((path, page));
     }
     assert!(commands.len() > 20);
@@ -256,10 +306,9 @@ fn conformance(args: &[&str]) {
 fn command_tree_output_conforms() {
     for (path, page) in commands() {
         let args: Vec<_> = path.iter().map(String::as_str).collect();
-        // The shared options are listed once, on the root page. Examples
-        // mention the flags too, so the test identifies the listing by its
-        // description.
-        for option in ["--timeout <SECONDS>", "Print the complete result as JSON"] {
+        // The shared options are listed once, on the root page. The leading
+        // spaces distinguish the JSON option's row from examples and prose.
+        for option in ["--timeout <SECONDS>", "      --json "] {
             assert_eq!(page.contains(option), path.is_empty(), "{path:?}: {option}");
         }
         assert!(!page.contains("--format"), "{path:?}");
@@ -278,9 +327,7 @@ fn command_tree_output_conforms() {
         } else if page.contains("Requires: nothing") {
             match args.as_slice() {
                 ["help"] => {
-                    for topic in [
-                        "agents", "states", "output", "devices", "datasets", "apps", "--all",
-                    ] {
+                    for topic in TOPICS.into_iter().chain(["--all"]) {
                         assert_eq!(
                             ark(&["help", topic]).stdout,
                             ark(&["help", topic, "--json"]).stdout
@@ -303,6 +350,77 @@ fn command_tree_output_conforms() {
                 }
             }
         }
+    }
+}
+
+/// Checks paragraph placement, every public topic and the full manual's page
+/// order through the executable.
+#[test]
+fn test_paragraphs_and_topics_follow_the_manual_order() {
+    // Every long command page opens with a description and a nonempty paragraph
+    let commands = commands();
+    for (path, long) in &commands {
+        let (opening, _) = long.split_once("\n\nUsage:").unwrap();
+        let (description, paragraph) = opening.split_once("\n\n").unwrap();
+        assert!(!description.is_empty(), "{path:?}");
+        assert!(!paragraph.trim().is_empty(), "{path:?}");
+        assert_eq!(paragraph, paragraph.trim(), "{path:?}");
+
+        let mut args: Vec<_> = path.iter().map(String::as_str).collect();
+        args.push("-h");
+        let output = ark(&args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let short = String::from_utf8(output.stdout).unwrap();
+        let (short_opening, _) = short.split_once("\n\nUsage:").unwrap();
+        assert_eq!(
+            short_opening,
+            if path.is_empty() {
+                opening
+            } else {
+                description
+            },
+            "{path:?}"
+        );
+
+        // A single name shared with a topic resolves to that topic; other
+        // command paths also print their long page through `ark help`
+        if path.len() != 1 || !TOPICS.contains(&path[0].as_str()) {
+            let mut args = vec!["help"];
+            args.extend(path.iter().map(String::as_str));
+            let output = ark(&args);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(output.stdout, long.as_bytes(), "{path:?}");
+        }
+    }
+
+    // The root lists all topics, and each prints text even in JSON mode
+    let closing = format!("Topics: {}.", TOPICS.join(", "));
+    assert!(commands[0].1.contains(&closing));
+    let topics: Vec<_> = TOPICS
+        .iter()
+        .map(|name| {
+            let output = ark(&["help", name]);
+            assert!(output.status.success(), "{name}: {output:?}");
+            assert!(output.stderr.is_empty(), "{name}");
+            assert_eq!(output.stdout, ark(&["help", name, "--json"]).stdout);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(!text.trim().is_empty(), "{name}");
+            text
+        })
+        .collect();
+
+    // Root, agents, command tree, then the remaining topics are separate pages
+    let output = ark(&["help", "--all"]);
+    assert!(output.status.success(), "{output:?}");
+    let manual = String::from_utf8(output.stdout).unwrap();
+    let separator = format!("\n\n{}\n\n", "-".repeat(80));
+    let pages: Vec<_> = manual.trim_end().split(&separator).collect();
+    let mut expected = vec![commands[0].1.trim_end(), topics[0].trim_end()];
+    expected.extend(commands[1..].iter().map(|(_, page)| page.trim_end()));
+    expected.extend(topics[1..].iter().map(|page| page.trim_end()));
+    assert_eq!(pages.len(), expected.len());
+    for (index, (page, expected)) in pages.iter().zip(expected).enumerate() {
+        assert_eq!(*page, expected, "page {index}");
     }
 }
 
@@ -339,7 +457,7 @@ fn documented_usage_errors_keep_the_text_prefix() {
     // Topics render in a pipe as on a terminal, so code spans lose their
     // backtick markers there and keep only their text
     let help = String::from_utf8(ark(&["help", "output"]).stdout).unwrap();
-    assert!(help.contains("Exit 2, usage"));
+    assert!(help.contains("Exit 2 is usage, for invalid arguments or an unknown help topic."));
     for args in [
         vec!["bogus"],
         vec!["--timeout", "0", "status"],
@@ -359,7 +477,7 @@ fn documented_usage_errors_keep_the_text_prefix() {
     // A missing device is the documented no-device error
     let output = ark(&["status", "--device", "hardware:palette-no-device"]);
     assert_eq!(output.status.code(), Some(3));
-    assert!(help.contains("no-device: no Ark found"));
+    assert!(help.contains("no-device means no Ark is attached, or none matches --device."));
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
@@ -391,6 +509,48 @@ fn usage_errors_are_json_in_both_streams() {
         assert_eq!(events[0]["event"], "error");
         let message = document["error"]["message"].as_str().unwrap();
         assert!(!message.contains("Usage:"), "{message}");
+    }
+}
+
+/// Checks that firmware confirmation is listed only on its command and fails
+/// as a usage error at the root, on the group and on other commands.
+#[test]
+fn test_firmware_confirmation_is_local_to_update() {
+    // Only the update command advertises either spelling in its options
+    for (path, page) in commands() {
+        assert_eq!(
+            page.contains("-y, --yes"),
+            path == ["firmware", "update"],
+            "{path:?}"
+        );
+    }
+
+    // Unknown options keep the usual exit class and output in both formats
+    for flag in ["-y", "--yes"] {
+        for args in [
+            vec![flag, "firmware", "update"],
+            vec!["firmware", flag, "update"],
+            vec!["firmware", "list", flag],
+            vec!["status", flag],
+        ] {
+            for json in [false, true] {
+                let mut invocation = args.clone();
+                if json {
+                    invocation.push("--json");
+                }
+                let output = ark(&invocation);
+                assert_eq!(output.status.code(), Some(2), "{invocation:?}");
+                if json {
+                    assert_eq!(json_output(&output)["error"]["code"], "usage");
+                } else {
+                    assert!(output.stdout.is_empty(), "{invocation:?}");
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).starts_with("error[usage]: "),
+                        "{invocation:?}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -475,11 +635,13 @@ fn json_selection_applies_before_help_and_usage_errors() {
 /// the supported commands.
 #[test]
 fn help_matches_the_supported_palette() {
-    // The root page stays within 42 lines
-    let output = ark(&["--help"]);
-    assert!(output.status.success());
-    let root = String::from_utf8(output.stdout).unwrap();
-    assert!(root.lines().count() <= 42, "{root}");
+    // Both root pages stay within 42 lines
+    for flag in ["-h", "--help"] {
+        let output = ark(&[flag]);
+        assert!(output.status.success());
+        let root = String::from_utf8(output.stdout).unwrap();
+        assert!(root.lines().count() <= 42, "{flag}: {root}");
+    }
 
     // Each long page carries every contract field and matches its help topic,
     // and its short page leaves the contract out

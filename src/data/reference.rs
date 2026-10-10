@@ -30,11 +30,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Plans the references and validates every download offer before any change,
-/// then installs the planned slots.
+/// Plans the references and installs each available download.
 ///
 /// Planning all references also checks their dependencies and orders the work,
-/// while a slot picked by `id` is installed alone. Stops at the first failure
+/// skipping filled slots and those without offers. A slot picked by `id` is
+/// installed alone and needs an offer unless filled. Stops at the first failure
 /// and reports completed, failed and unattempted slots. A dry run only plans.
 pub(super) fn fetch(
     context: &Context,
@@ -49,28 +49,69 @@ pub(super) fn fetch(
     let directory = directory
         .map(Path::to_path_buf)
         .unwrap_or_else(cache::directory);
+    let directory = if no_cache {
+        None
+    } else {
+        Some(directory.as_path())
+    };
     let ordered = plan(slots, id)?;
-    for slot in ordered.iter().filter(|slot| !filled(slot)) {
-        offer(slot)?;
-    }
+    execute(context, &ordered, dry_run, directory, |source| {
+        install(context, connection, source, directory)
+    })
+}
 
+/// Installs a validated plan in order, retaining skipped and unattempted rows.
+///
+/// A dry run reports the plan without invoking the installer.
+fn execute(
+    context: &Context,
+    ordered: &[&SlotStatus],
+    dry_run: bool,
+    directory: Option<&Path>,
+    mut install: impl FnMut(&Source) -> Result<(), Error>,
+) -> Result<(), Error> {
     // Start each row as skipped, planned or not attempted, and keep them as
     // the partial result
-    let mut rows:Vec<Value>=ordered.iter().map(|slot| {
-        let offer=download(slot);
-        json!({"slot":slot_name(slot.kind),"id":slot.kind,"url":offer.map(|o|o.0),"size_bytes":offer.map(|o|o.1),"sha256":offer.map(|o|o.2),
-            "cached":!no_cache && offer.is_some_and(|o|cache::cached(&directory, o.2)),
-            "outcome":if filled(slot) {"skipped"} else if dry_run {"planned"} else {"not-attempted"},"error":null})
-    }).collect();
+    let mut rows: Vec<Value> = ordered
+        .iter()
+        .map(|slot| {
+            let offer = download(slot);
+            json!({
+                "slot": slot_name(slot.kind),
+                "id": slot.kind,
+                "url": offer.map(|offer| offer.0),
+                "size_bytes": offer.map(|offer| offer.1),
+                "sha256": offer.map(|offer| offer.2),
+                "cached": directory.is_some_and(|directory| {
+                    offer.is_some_and(|offer| cache::cached(directory, offer.2))
+                }),
+                "outcome": if filled(slot) || offer.is_none() {
+                    "skipped"
+                } else if dry_run {
+                    "planned"
+                } else {
+                    "not-attempted"
+                },
+                "error": null,
+            })
+        })
+        .collect();
     context.interrupt.partial(json!({"fetched":rows}));
 
-    // Install in order, skipping filled slots and stopping at the first failure
+    // Install available offers in order, stopping at the first failure
     let mut failure = None;
     for (index, slot) in ordered.iter().enumerate() {
         if filled(slot) {
             context.output.event(
                 "note",
                 format!("{} is already filled", slot_name(slot.kind)),
+            );
+            continue;
+        }
+        if download(slot).is_none() {
+            context.output.event(
+                "note",
+                format!("{} offers no download", slot_name(slot.kind)),
             );
             continue;
         }
@@ -81,12 +122,7 @@ pub(super) fn fetch(
                 context
                     .output
                     .title(&format!("Fetching {}", slot_name(slot.kind)));
-                install(
-                    context,
-                    connection,
-                    &source,
-                    if no_cache { None } else { Some(&directory) },
-                )
+                install(&source)
             }
         });
         match result {
@@ -121,17 +157,21 @@ pub(super) fn fetch(
 }
 
 /// Orders the reference slots after their dependencies, or picks the one slot
-/// `id` names.
+/// `id` names, validating every offer the plan will install.
 ///
 /// Dependency checks apply only when planning all references, where they
 /// decide the order even for slot kinds this tool does not know. There a
-/// cycle, or an empty slot's dependency that is neither filled nor planned
-/// before it, is refused. A slot `id` names is returned without checking its
-/// dependencies.
+/// cycle, or an empty slot's dependency that is neither filled nor offered
+/// for installation before it, is refused. A slot `id` names is returned
+/// without checking its dependencies, but needs an offer unless filled.
 fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error> {
     // A named slot is fetched alone
     if let Some(id) = id {
-        return Ok(vec![select(slots, id)?]);
+        let slot = select(slots, id)?;
+        if !filled(slot) {
+            offer(slot)?;
+        }
+        return Ok(vec![slot]);
     }
 
     // Take the first slot without a pending dependency, since none means a
@@ -160,14 +200,15 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
             })?;
         let slot = pending.remove(index);
 
-        // An empty slot's dependencies must be filled or planned before it
+        // An empty slot's dependencies must be filled or offered before it
         for dependency in slot.deps.iter().filter(|_| !filled(slot)) {
             if !slots.iter().any(|other| {
                 other.kind == *dependency
                     && (filled(other)
-                        || ordered
-                            .iter()
-                            .any(|ordered: &&SlotStatus| ordered.kind == *dependency))
+                        || (download(other).is_some()
+                            && ordered
+                                .iter()
+                                .any(|ordered: &&SlotStatus| ordered.kind == *dependency)))
             }) {
                 return Err(Error::new(
                     5,
@@ -181,6 +222,14 @@ fn plan(slots: &[SlotStatus], id: Option<i32>) -> Result<Vec<&SlotStatus>, Error
             }
         }
         ordered.push(slot);
+    }
+
+    // Missing offers are skipped, but malformed offers fail before any change
+    for slot in ordered
+        .iter()
+        .filter(|slot| !filled(slot) && download(slot).is_some())
+    {
+        offer(slot)?;
     }
     Ok(ordered)
 }
@@ -810,13 +859,25 @@ mod tests {
         }
     }
 
+    /// Builds an empty reference slot with an invented, valid download offer.
+    fn offered(id: i32, deps: &[i32]) -> SlotStatus {
+        SlotStatus {
+            download: Some(SlotDownload {
+                url: "https://example.test/reference.gz".into(),
+                bytes: 10,
+                sha256: "ab".repeat(32),
+            }),
+            ..reference(id, deps, false)
+        }
+    }
+
     /// The plan keeps filled slots in dependency order, and refuses cycles and
     /// missing dependencies of empty slots.
     #[test]
     fn dependency_order_retains_filled_slots_and_detects_missing_inputs() {
         let slots = [
             reference(3, &[1], false),
-            reference(1, &[0], false),
+            offered(1, &[0]),
             reference(0, &[], true),
         ];
         assert_eq!(
@@ -836,6 +897,179 @@ mod tests {
         );
         assert!(plan(&[reference(1, &[2], false)], None).is_err());
         assert_eq!(plan(&[reference(1, &[2], true)], None).unwrap().len(), 1);
+    }
+
+    /// Fetching all references skips missing offers, preserves dependencies
+    /// and reports the same skips in a dry run.
+    #[test]
+    fn test_fetch_skips_unavailable_references() {
+        // Child scenarios use the command's planner and executor, recording
+        // installations instead of opening a device or fetching public data
+        if let Ok(scenario) = std::env::var("ARK_TEST_FETCH_SCENARIO") {
+            let options = crate::args::Cli::parse_from(["ark", "--json"]).options;
+            let output = Output::new(&options);
+            let context = Context {
+                options,
+                interrupt: crate::interrupt::Interrupt::install(output.clone()).unwrap(),
+                output,
+            };
+            let directory = Directory::new();
+            let mut slots = [
+                offered(2, &[3, 1]),
+                reference(4, &[3], false),
+                offered(1, &[3]),
+                SlotStatus {
+                    origin: SlotOrigin::Personal as i32,
+                    ..reference(3, &[], true)
+                },
+            ];
+            let mut id = None;
+            let dry_run = scenario == "dry-run";
+            match scenario.as_str() {
+                "all" | "dry-run" | "failed" => {}
+                "named" => id = Some(4),
+                "missing-calls" => {
+                    slots[3].state = SlotState::Empty as i32;
+                    for slot in &mut slots {
+                        slot.download = None;
+                    }
+                }
+                "skipped-dependency" => slots[0].deps = vec![4],
+                "filled" => slots[1].state = SlotState::Filled as i32,
+                "malformed" => slots[0].download.as_mut().unwrap().sha256 = "bad".into(),
+                _ => panic!("unexpected scenario {scenario}"),
+            }
+
+            // Planning errors precede all installations, and a transfer failure
+            // retains the completed plan's skipped and unattempted rows
+            let mut installed = Vec::new();
+            writeln!(std::io::stdout(), "<result>").unwrap();
+            let result = plan(&slots, id).and_then(|ordered| {
+                execute(&context, &ordered, dry_run, Some(&directory.0), |source| {
+                    installed.push(source.dataset.slot.unwrap());
+                    assert_eq!(source.url, "https://example.test/reference.gz");
+                    assert_eq!(source.dataset.size, 10);
+                    assert_eq!(source.dataset.sha256, Some([0xab; 32]));
+                    if scenario == "failed" {
+                        Err(Error::new(5, "ark", "reference upload refused"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            });
+            let expected = match scenario.as_str() {
+                "all" | "filled" => vec![1, 2],
+                "failed" => vec![1],
+                _ => vec![],
+            };
+            assert_eq!(installed, expected);
+            let code = match result {
+                Ok(()) => 0,
+                Err(error) => {
+                    if !context.output.printed() {
+                        context
+                            .output
+                            .document(&json!({"error": error.json()}))
+                            .unwrap();
+                    }
+                    context.output.error(&error);
+                    error.class
+                }
+            };
+            writeln!(std::io::stdout(), "</result>").unwrap();
+            drop(directory);
+            std::process::exit(i32::from(code));
+        }
+
+        // Capture exact documents, note events and exit classes at the output
+        // boundary, including planning failures before any partial result
+        for (scenario, code, error) in [
+            ("all", 0, None),
+            ("dry-run", 0, None),
+            ("named", 5, Some("no-download")),
+            ("missing-calls", 5, Some("dependency-missing")),
+            ("skipped-dependency", 5, Some("dependency-missing")),
+            ("filled", 0, None),
+            ("malformed", 1, Some("file-rejected")),
+            ("failed", 5, Some("ark")),
+        ] {
+            let captured = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "data::reference::tests::test_fetch_skips_unavailable_references",
+                    "--nocapture",
+                ])
+                .env("ARK_TEST_FETCH_SCENARIO", scenario)
+                .output()
+                .unwrap();
+            assert_eq!(
+                captured.status.code(),
+                Some(code),
+                "{scenario}: {captured:?}"
+            );
+            let stdout = String::from_utf8(captured.stdout).unwrap();
+            let document = stdout
+                .split_once("<result>\n")
+                .unwrap()
+                .1
+                .split_once("</result>\n")
+                .unwrap()
+                .0;
+            let document: Value = serde_json::from_str(document).unwrap();
+            let stderr = String::from_utf8(captured.stderr).unwrap();
+            let events: Vec<Value> = stderr
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if let Some(error) = error {
+                assert_eq!(events.last().unwrap()["error"]["code"], error, "{scenario}");
+                if scenario != "failed" {
+                    assert_eq!(document["error"]["code"], error, "{scenario}");
+                    assert_eq!(events.len(), 1, "{scenario}");
+                    continue;
+                }
+            }
+
+            // The unavailable catalog has no download metadata or cache hit;
+            // the offered slots keep their dependency order and outcomes
+            assert_eq!(
+                document["fetched"][0],
+                json!({
+                    "slot": "variant-catalog", "id": 4, "url": null,
+                    "size_bytes": null, "sha256": null, "cached": false,
+                    "outcome": "skipped", "error": null,
+                }),
+                "{scenario}"
+            );
+            assert_eq!(document["fetched"].as_array().unwrap().len(), 3);
+            for (index, slot) in [(1, "reference-genome"), (2, "gene-annotations")] {
+                let row = &document["fetched"][index];
+                assert_eq!(row["slot"], slot, "{scenario}");
+                assert_eq!(
+                    row["outcome"],
+                    match scenario {
+                        "dry-run" => "planned",
+                        "failed" if index == 1 => "failed",
+                        "failed" => "not-attempted",
+                        _ => "done",
+                    },
+                    "{scenario}"
+                );
+            }
+            assert_eq!(
+                events[0],
+                json!({
+                    "event": "note",
+                    "message": if scenario == "filled" {
+                        "variant-catalog is already filled"
+                    } else {
+                        "variant-catalog offers no download"
+                    },
+                }),
+                "{scenario}"
+            );
+            assert_eq!(events.len(), if scenario == "failed" { 2 } else { 1 });
+        }
     }
 
     /// Offers need HTTPS without credentials, a filename and a complete digest,

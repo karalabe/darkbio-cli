@@ -3,28 +3,28 @@
 [![](https://img.shields.io/crates/v/darkbio-ark.svg)](https://crates.io/crates/darkbio-ark)
 [![](https://github.com/dark-bio/cli/workflows/tests/badge.svg)](https://github.com/dark-bio/cli/actions/workflows/ci.yml)
 
-`ark` is the command line interface to [Ark](https://dark.bio) enclaves. An Ark holds one person's data. It is plugged into your computer over USB, or emulated on it by [Ark Emulator](https://github.com/dark-bio/emulator). Its owner approves access from their phone in Ark Companion, available on the [App Store](https://apps.apple.com/app/id6751324700) and [Google Play](https://play.google.com/store/apps/details?id=bio.dark.companion). This tool talks to the Ark, the Dark Bio cloud and the phone on the owner's behalf, but it can never approve anything itself.
+**Built for people. Ready for agents.**
 
-What this tool does:
-
-- **Discovery**: find hardware Arks over USB and locally running emulators.
-- **Unlocking**: pair once with the phone, unlock after every reboot.
-- **Datasets**: inspect slots, upload your own files and install public reference data.
-- **Apps**: run WebAssembly apps on the Ark and collect their reports.
-- **Firmware**: list published builds, install and verify an update.
-- **Diagnostics**: check your computer, the Ark and the cloud, and suggest fixes.
+`ark` is the command line interface to [Ark](https://dark.bio) enclaves. An
+Ark holds one person's genomic data and runs apps on it. It is plugged into
+your computer over USB, or emulated on it by
+[Ark Emulator](https://github.com/dark-bio/emulator). Its owner approves
+access to their data on their phone in Ark Companion, available on the
+[App Store](https://apps.apple.com/app/id6751324700) and
+[Google Play](https://play.google.com/store/apps/details?id=bio.dark.companion).
+`ark` talks to the Ark and the Dark Bio cloud, and it cannot approve anything
+for the owner.
 
 ## Installation
 
 Homebrew on macOS:
 
 ```sh
-# Pick one or the other
-brew install dark-bio/tap/ark-cli      # Stable releases
-brew install dark-bio/tap/ark-cli-dev  # Develop releases
+brew install dark-bio/tap/ark-cli      # stable releases
+brew install dark-bio/tap/ark-cli-dev  # develop releases
 ```
 
-Shell installer on Linux:
+The shell installer on Linux:
 
 ```sh
 curl -fsSL https://github.com/dark-bio/cli/releases/latest/download/ark-installer.sh | sh
@@ -36,11 +36,9 @@ With Rust, you can build it yourself:
 cargo install darkbio-ark --locked
 ```
 
-Plain executables are attached to every [GitHub release](https://github.com/dark-bio/cli/releases).
-
----
-
-*Note, on Linux you need to grant your user access to the USB device once:*
+Plain executables are attached to every
+[GitHub release](https://github.com/dark-bio/cli/releases). On Linux, your
+user needs access to the Ark's USB device once:
 
 ```sh
 echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="10f1", TAG+="uaccess"' \
@@ -54,80 +52,96 @@ Plug in your Ark, or [start an emulated one](#emulated-arks), and run:
 
 ```sh
 ark devices                       # find the Ark
-ark status                        # trust, firmware, paired, unlocked
-ark pair                          # if unpaired; scan in Ark Companion
-ark unlock                        # if locked; approve on the phone
-ark data list                     # what is loaded
-ark app run my.wasm > report.md   # approve on the phone; report on stdout
+ark status                        # trust, firmware, pairing and lock
+ark pair                          # once, with your phone and the Ark's button
+ark unlock                        # after each power loss, approved on your phone
+ark data list                     # what the Ark holds
+ark data upload calls.vcf.gz      # your variant calls, approved on your phone
+ark data fetch --all              # the public references for them
+ark app run my.wasm > report.md   # approve on your phone, then release the report
 ```
 
-Pairing happens once. Unlocking lasts until the Ark loses power. Check `ark status` before a data command or app run; these need an unlocked Ark. If it reports locked, `--unlock` lets the command unlock first, with phone approval. Nothing bypasses the phone. Deleting the pairing in Ark Companion discards the unlock key, and the reset button on the Ark erases all data.
+Pairing happens once, and the Ark stays unlocked until it loses power. The
+Ark's button sits behind a pinhole under its bottom right LED, to the right
+of the USB cable, and is pressed with the pin that came with the Ark.
 
 ## Emulated Arks
 
-[Ark Emulator](https://github.com/dark-bio/emulator) boots the real Ark firmware on your computer, for development and demos, and `ark` talks to it as it does to hardware. It keeps its data in a plain file, so keep real data on hardware. A fresh emulator is enrolled once, in a browser at [Ark Hub](https://hub.dark.bio), before it pairs:
+[Ark Emulator](https://github.com/dark-bio/emulator) boots the real Ark
+firmware on your computer, for development and demos, and `ark` talks to it
+as to hardware. It keeps its data in a plain file, so real data belongs on
+hardware. A fresh emulator is enrolled once, in a browser at
+[Ark Hub](https://hub.dark.bio), before it pairs:
 
 ```sh
 ark-emulator start   # boot one; prints its locator once it is ready
 ark enroll           # prints where to enroll it at Ark Hub
 ```
 
-After that, the first session above applies. The enrollment lasts 30 days; then `ark-emulator stop`, `ark-emulator wipe` and `ark-emulator start` give a fresh device to enroll again. `ark-emulator --help` covers the rest.
+The enrollment lasts 30 days. `ark-emulator stop`, `ark-emulator wipe` and
+`ark-emulator start` then give a fresh device to enroll again.
 
-## Datasets
+## Commands
 
-The Ark keeps data in named slots. `ark data list` shows the inventory, `ark data show <slot>` adds a slot's description and upload format, and `ark data paths` maps the data apps can read, with `--json` giving each path's description, exact format and examples. These commands do not transfer datasets.
+| Command | What it does | Who approves |
+| --- | --- | --- |
+| `ark devices` | Lists hardware Arks and running emulators | nobody |
+| `ark status` | Shows identity, firmware, pairing and lock, offline | nobody |
+| `ark genuine` | Checks the Ark against Dark Bio's device registry | nobody |
+| `ark enroll` | Gives an emulator an attested identity at Ark Hub | nobody; the person enrolls it in a browser |
+| `ark pair` | Pairs the Ark with Ark Companion, once | the owner, on the phone and the Ark's button |
+| `ark unlock` | Unlocks the Ark after a power loss | the owner, on the phone |
+| `ark data list`, `show` | Shows the dataset slots and their state | nobody |
+| `ark data paths` | Maps the data an app can read | nobody |
+| `ark data upload` | Uploads the owner's variant calls | the owner, on the phone |
+| `ark data fetch` | Downloads public reference data onto the Ark | nobody |
+| `ark data delete`, `repair` | Empties or erases a slot | the owner, on the phone |
+| `ark app run` | Runs an app and prints its report | the owner, on the phone, for the run and its report |
+| `ark firmware list`, `update` | Lists and installs firmware | by the Ark's state: nobody, the Ark's button or the phone |
+| `ark doctor` | Checks this computer, the Ark and the cloud | nobody |
 
-```sh
-ark data upload calls.vcf.gz --dry-run   # identify and plan without changes
-ark data upload calls.vcf.gz             # identify, approve, upload, process
-ark data fetch --all                     # fill empty public reference slots
-```
+Data and app commands need a paired, unlocked Ark. `ark <command> --help`
+prints a command's full contract: what it requires, who approves, how long it
+takes, what it prints and how it exits.
 
-Uploads of your own data are approved on the phone; public reference downloads are not. The Ark identifies a file itself, `--slot` only asserts what you expect. Reference downloads are cached on your computer and resume after interruptions; `ark doctor` shows where the cache lives. `ark data delete` empties a filled slot and `ark data repair` resets a damaged slot; both offer `--dry-run`. See `ark help datasets` for dependencies, build metadata and cache details.
+## AI agents
 
-## Apps
+AI agents read [`ark help agents`](src/help/agents.md) first. It covers
+running commands in the background, passing on the owner's approvals,
+reading results and getting an Ark ready. Nothing prompts without a terminal
+or under `--json`. `--json` prints complete, exact values, and the exit code
+says what happened. [`ark help output`](src/help/output.md) defines the
+streams, the JSON documents and every error code.
 
-An app is one WebAssembly file that reads the paths it declares and prints a report. `ark app run my.wasm` uploads it, waits for the owner's approval and runs it on the Ark. The owner then reviews the report on their phone, and once they release it, the command writes its exact bytes to stdout. Redirect stdout to save it, or use `--json` to include the task's metadata. Ctrl-C cancels the task, and so does closing the terminal that started it. `ark data paths` describes the data tree; `ark help apps` has the manifest, grant rules and sandbox limits. The [examples](https://github.com/dark-bio/examples) repository has worked apps in Rust, Go, C and Python, with fixtures that run them on your computer.
-
-## Firmware
-
-`ark firmware list` shows the installed build and published candidates; `ark firmware update` installs the newest candidate and waits for the Ark to return running it. Who approves depends on the Ark's state: nobody while unpaired, the device button while paired and locked, the phone while unlocked. The installation itself is confirmed on this computer, with `--yes` when there is no one to ask.
-
-This release needs Ark firmware 0.11.5 or later; `ark --version` prints the minimum. An older Ark is still served by `status`, `doctor`, the `firmware` commands and `enroll --cwt`, enough to bring it up to date. An emulator runs the firmware bundled with Ark Emulator, so a newer emulator release is its update.
-
-## Devices and diagnostics
-
-One Ark is picked automatically. With several, select one with `-d` by locator, serial, name or emulator image, or with the bare words `hardware` and `emulator`. Run commands one at a time, including reads. `device-busy` means another `ark` command or an Ark Hub browser tab holds the USB session.
-
-`ark status` shows the Ark's attested identity and works offline, and `ark genuine` checks that identity against Dark Bio's device registry. When something is off, `ark doctor` checks your computer, the Ark and the cloud, and suggests fixes without applying them. `-v` adds step narration; `--log debug` or `--log trace` enables diagnostic logs.
-
-## Output and automation
-
-Default output is formatted for reading. Use `--json` for complete, exact values, with an indented result document on stdout and one JSON event per line on stderr. App reports pass through raw by default. Color requires a terminal; `NO_COLOR` or `CLICOLOR=0` disables it.
-
-AI agents should read [`ark help agents`](src/help/agents.md) first. Nothing prompts without a terminal or with `--json`, and the exit code says what happened. `ark help output` defines the streams, JSON fields and error codes.
+The [examples](https://github.com/dark-bio/examples) repository has worked
+apps in Rust, Go, C and Python, with fixtures that run them on your computer.
 
 ## Help
 
-`ark -h` is the scan. For one command, `ark <command> --help` or `ark help <command>` adds its contract: what it requires, who approves, how long it takes, what it prints and how it exits. Global flags are available on every command. Six topics cover the rest, and `ark help --all` prints the whole manual. Each topic's source in [`src/help`](src/help) reads the same on GitHub:
+`ark -h` is the overview, and `ark help --all` prints the whole manual. The
+topics cover the rest, and each one's source in [`src/help`](src/help) reads
+the same on GitHub:
 
 | Topic | Contents |
 | --- | --- |
-| [`agents`](src/help/agents.md) | Driving the tool from a script or an AI agent |
-| [`states`](src/help/states.md) | Pairing, locking, trust and firmware compatibility |
-| [`output`](src/help/output.md) | Reading output, JSON, streams and error codes |
-| [`devices`](src/help/devices.md) | Locators, selection, emulators and cloud environments |
+| [`agents`](src/help/agents.md) | Running ark from an AI agent, the approvals it waits on, and common tasks |
+| [`devices`](src/help/devices.md) | Finding an Ark, trust, pairing and unlocking, emulators and cloud environments |
 | [`datasets`](src/help/datasets.md) | Slots, uploads, reference downloads and the cache |
-| [`apps`](src/help/apps.md) | The manifest, the sandbox and its limits |
+| [`apps`](src/help/apps.md) | Running an app, the manifest, grants, questions, the data map and the sandbox |
+| [`firmware`](src/help/firmware.md) | Compatibility, published builds and updates |
+| [`output`](src/help/output.md) | Reading output, JSON, events and error codes |
 
-`ark completions <shell>` generates completions for your shell.
+`ark completions <shell>` prints completions for your shell.
 
-## Disclaimer
+## Stability
 
-The Ark, its protocols and this tool are still evolving quickly. `ark help output` describes the JSON contract; reading layouts may change. Firmware, cloud and tool versions are expected to move together.
+The Ark, its protocols and this tool still change quickly, and firmware,
+cloud and tool versions move together. `ark --version` prints the oldest
+firmware this build works with. The JSON documents and error codes follow
+`ark help output`, while the reading layouts may change.
 
-The connection library in `connect/` is internal to this CLI package. Its Rust API is unstable and is not a supported integration interface.
+The connection library in `connect/` is internal to this package. Its Rust
+API is unstable and is not a supported integration interface.
 
 ## License
 

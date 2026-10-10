@@ -6,9 +6,9 @@
 
 //! Pairing links and terminal presentation of the owner's steps.
 
-use crate::{context::Context, error::Error};
+use crate::{context::Context, error::Error, output::Output};
 use darkbio_connect::{
-    PairingProgress,
+    DeviceKind, PairingProgress,
     trust::{Environment, Realm},
 };
 use serde_json::json;
@@ -97,9 +97,7 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
                 if let Some(name) = previous.take() {
                     context.output.stage(name, true);
                 }
-                context
-                    .output
-                    .event("approve", "confirm the colors on the Ark and your phone");
+                approve(&context.output, connection.device.kind());
                 if context.output.terminal() {
                     previous = Some("approval");
                 }
@@ -128,6 +126,14 @@ pub(crate) fn run(context: &Context) -> Result<(), Error> {
     context
         .output
         .document(&json!({"serial": serial, "paired": true}))
+}
+
+/// Describes the color check and button location for the connected device kind.
+fn approve(output: &Output, kind: DeviceKind) {
+    output.event("approve", match kind {
+        DeviceKind::Hardware => "if the colors on the Ark and your phone match, press the Ark's button with the pin that came with it, in the pinhole under the bottom right LED",
+        DeviceKind::Emulator => "if the colors on the emulated Ark and your phone match, press its button in the Ark Emulator window, or run `ark-emulator button press --release-after 0`",
+    });
 }
 
 /// Starts a human stage after completing the previous one, or emits the
