@@ -1,86 +1,113 @@
 # Datasets
 
-`ark data list` is a compact inventory of slots and their state, and
-`ark data show SLOT` adds the detail it leaves out. `ark data paths` maps the
-data an app can read. None of them transfers dataset bytes. Numeric slot IDs
-remain usable when a new kind has no name in this CLI build.
+An Ark keeps its data in slots, one per kind of dataset. The personal slot
+holds the owner's variant calls, which ark uploads with their approval on
+the phone. The reference slots hold public data that the Ark offers for
+download, which ark fetches without an approval. Every data command needs a
+paired, unlocked Ark, as `ark help devices` describes. `ark data paths` maps
+what apps read from the slots, as `ark help apps` describes.
 
-Check `ark status` before a data command. It needs a paired, unlocked Ark;
-use --unlock only if status reports locked, and the owner will approve on
-the phone. A dry run never unlocks and conflicts with --unlock.
+## Slots
 
-## Slot fields
+`ark data list` shows every slot and its state, and `ark data show SLOT`
+shows one slot in full. A command names a slot as the list prints it, or by
+its number, which keeps a slot this build has no name for usable. An Ark
+has these slots:
 
-JSON list entries contain slot, id, name, description, format, state, origin,
-damage, requires, size_bytes, build, version and download. show adds required_by
-and cached. The reading list keeps to short columns, while show also prints the
-full description and format. Both show dependency state alongside each name.
+- reference-genome, the human reference genome assembly
+- gene-annotations, the genes and their coordinates on that assembly
+- snp-indel-calls, the owner's variant calls, from a VCF file
+- variant-catalog, dbSNP's catalog of rsIDs and their positions
 
-- description explains the slot's data to its owner. format shows whoever fills
-  the slot which file it accepts, the shape that file needs, what the Ark
-  refuses and whether the owner approves the upload.
-- size_bytes is the bytes on the Ark's disk for this slot, zero when empty.
-  It is not the original upload or download size; processing may change it.
-- build is the reference assembly, for example GRCh38.p14. The Ark matches
-  datasets by assembly family rather than exact patch, so GRCh38.p13 beside
-  GRCh38.p14 is normal, and it refuses data that does not fit. version is the
-  dataset's own release, for example dbSNP 157 for variant-catalog; it is not
-  a firmware version.
-- requires names dependency slots, whether already filled or still missing.
-  The reading view marks each as filled or not filled. required_by names the
-  slots that depend on this one. These relationships differ from a help page's
-  Requires preconditions.
-- download is what the Ark offers to fill an empty slot, with url, size_bytes
-  and sha256; the CLI never builds a URL itself. It says nothing about what a
-  slot already holds, which is what state reports.
-- cached refers only to this computer's download cache, never to the Ark. yes
-  means a file named by the advertised SHA-256 is already here, which fetch
-  still verifies as it replays. Personal slots always print no, since personal
-  uploads are never cached.
+With --json each slot carries:
 
-## Data paths
+- slot and id, its name and number
+- name, description and format, the Ark's own texts. description says what
+  the slot holds. format says which file fills it, the shape that file
+  needs, what the Ark refuses and whether the owner approves the upload.
+- state, which is empty, filled or damaged. A damaged slot holds files whose
+  metadata is missing, corrupt or outdated, and damage says what is wrong.
+- origin, which is personal or reference
+- requires, the slots that must be filled before this one accepts data
+- size_bytes, the space the slot takes on the Ark's disk, 0 when empty
+- build, the assembly the data is on, such as GRCh38.p14, or for an empty
+  reference slot the assembly of the file it offers
+- version, the dbSNP release of the variant catalog, such as 157, and null
+  for the other slots
+- download, the file the Ark offers for a reference slot that is not
+  filled, with url, size_bytes and sha256, otherwise null
 
-`ark data paths` prints every path pattern an app can read as an indented
-tree, with each entry under its parent. A trailing / marks a directory, + one a
-manifest may grant, and ! data this Ark lacks, which covers everything beneath
-the marked entry. Placeholders such as <gene> stand for values an app fills in.
-The column to the right lists examples, sample values for a placeholder and
-sample contents for a file.
+`ark data show` adds required_by, the slots that require this one, and
+cached, whether this computer's download cache holds the offered file. The
+reading list marks each requirement as filled or not filled, and hints at
+the command that fills or erases a slot.
 
---json returns the same entries in order, each with path, directory, grantable,
-available, description, format and examples. path is complete, v1/ included,
-and is what a manifest names. description says what the path holds, when it is
-absent and when reading it fails. format gives a file's exact contents or what a
-directory lists, and examples lists sample values, most typical first.
+The Ark offers the references for the assembly family of the owner's calls,
+so GRCh38.p14 references beside GRCh38.p13 calls are normal.
 
-available means the slots a pattern needs are filled, not that every gene,
-position or genotype has an answer. The map never carries a value from the
-owner's data. When anything is unavailable, a hint points at `ark data list`.
-`ark help apps` covers manifest grants and the Ark's checks before an app runs.
+## Filling an Ark
 
-## Transfers and changes
+Every reference slot requires snp-indel-calls, since the Ark offers the
+references for the assembly of the owner's calls. Calls on GRCh37 or GRCh38
+get all three references, and calls on other assemblies, such as
+T2T-CHM13v2.0, only some. A fresh Ark fills in two steps:
 
-`ark data upload FILE` asks the Ark to identify the first bytes, then uploads
-and waits for validation and indexing. Compressed files stay compressed.
---slot asserts the expected identification. --dry-run stops after identification
-and reads the slot state without changing it.
+1. `ark data upload calls.vcf.gz` uploads the owner's calls, approved on
+   their phone.
+2. `ark data fetch --all` downloads every reference the Ark offers for the
+   calls' assembly, without an approval.
 
-`ark data fetch SLOT` installs the reference download advertised by the Ark.
---all fills empty reference slots in dependency order; filled slots are skipped.
-Each item reports done, skipped, failed, or not-attempted. A dry run reports
-planned or skipped. Download URLs are never guessed. On a fresh Ark the
-reference slots can require snp-indel-calls first: the owner must upload
-personal calls before --all can fill those references. --all does not supply
-personal data.
+## Uploading
 
-The CLI streams and caches public reference bytes at the same time. Files are
-addressed by SHA-256; incomplete entries retain resumable prefixes. Transport
-failures retry at most three attempts, opening a new Ark session and replaying
-the prefix. A changed server response restarts from zero. Cache corruption falls
-back to a fresh download, and cache write failure does not stop a transfer.
---cache selects a directory, --no-cache opts out, doctor reports its location.
-Personal uploads and app reports are never copied into this cache.
+`ark data upload FILE` uploads the owner's variant calls, a VCF file with
+one person's genotypes, plain or compressed. The Ark first identifies the
+file from its first bytes, and refuses any other kind of file with
+file-rejected, naming the reason. `ark data show snp-indel-calls` gives the
+exact format it accepts. --slot names the slot you expect, and the upload
+fails with invalid-slot when the Ark identifies another. --dry-run stops
+after the identification and reports the target slot's state and
+requirements.
 
-Delete empties a filled slot; repair resets a damaged or half-written slot.
-Both ask the owner when the Ark requires it and offer --dry-run. The dry run
-shows dependent slots; the Ark decides whether the real operation is allowed.
+The target slot has to be empty, since the Ark refuses to overwrite a
+dataset. Replacing the owner's calls takes `ark data delete snp-indel-calls`
+first. New calls on another assembly family leave the references of the old
+one in place, so delete those too and fetch them again. The owner approves
+the upload on their phone within 1 minute, and ark uploads the file and
+waits while the Ark validates and indexes it, which takes minutes to an
+hour. A file that fails validation ends with error[ark], exit 5, naming the
+reason. Once processing has started it runs to the end on the Ark, even when
+ark is interrupted.
+
+## Reference downloads
+
+`ark data fetch SLOT` downloads the file the Ark offers for a reference slot
+that is not filled, and streams it to the Ark. ark checks the bytes against
+the offered SHA-256 on the way, and a mismatch stops the upload before the
+Ark processes it. `ark data fetch --all` does the same for every reference
+slot that is not filled, in the order their requirements set, and skips the
+filled ones. ark never builds a download address itself.
+
+--all skips a reference slot that offers no file, as for calls on an
+assembly without that reference, and notes which. It fails with
+dependency-missing when the owner's calls are missing, and checks every
+offer before it downloads anything. Naming a slot that offers no file fails
+with no-download. The first failure stops the rest. Each slot ends as done,
+skipped, failed or not-attempted, or as planned or skipped under --dry-run.
+--json returns them as fetched, each with slot, id, url, size_bytes, sha256,
+cached, outcome and error.
+
+Downloads go through a cache on this computer, whose location `ark doctor`
+shows. A file is kept under its SHA-256, and a cached file uploads again
+without a download. An interrupted download keeps what arrived and resumes
+from there, and network failures get 3 attempts in all. --cache picks
+another directory, and --no-cache streams without keeping a copy. The cache
+holds only public reference files.
+
+## Emptying a slot
+
+`ark data delete SLOT` empties a slot that holds a dataset, and refuses an
+empty one. `ark data repair SLOT` erases a slot whatever its state, which
+recovers a damaged or half-written slot that delete refuses, and erases a
+healthy dataset too. Both wait up to 2 minutes for the owner's approval on
+the phone. Their --dry-run shows the slot's state and the slots that
+require it, and changes nothing.

@@ -27,7 +27,7 @@ pub(crate) struct Cli {
     // Options propagated to every command level by clap
     #[command(flatten)]
     pub options: Options,
-    /// Tool, connect and wire versions
+    /// Versions and the oldest firmware supported
     #[arg(short = 'V', long)]
     pub version: bool,
     /// Print help; `ark help --all` prints the manual
@@ -79,34 +79,31 @@ impl Cli {
 // Invocation-wide presentation and device policy, independent of connect's API
 #[derive(Args, Clone)]
 pub(crate) struct Options {
-    /// Which Ark: locator, unique serial, name, image, or hardware/emulator
+    /// Which Ark: locator, serial, name, image or kind
     #[arg(short = 'd', long, global = true, value_name = "SELECTOR")]
     pub device: Option<String>,
-    /// Print the complete result as JSON and stderr events as JSON Lines
+    /// Print the result as JSON and events as JSON Lines
     #[arg(long, global = true)]
     pub json: bool,
-    /// Seconds to wait for each reply or network chunk, not an approval or the whole task
+    /// Seconds to wait for each machine reply
     #[arg(long, global = true, default_value_t = 60, value_parser = parse_timeout, value_name = "SECONDS")]
     pub timeout: u64,
-    /// Unlock first when needed, approved on your phone
+    /// Unlock a locked Ark first, approved on your phone
     #[arg(long, global = true)]
     pub unlock: bool,
-    /// Confirm firmware installation and reboot
-    #[arg(short = 'y', long, global = true)]
-    pub yes: bool,
-    /// Never prompt; fail with the flag needed to continue
+    /// Never prompt; fail naming the flag instead
     #[arg(long, global = true)]
     pub no_input: bool,
-    /// Cloud environment; overriding a trusted attestation produces a warning
+    /// Cloud environment: release, staging or develop
     #[arg(long, global = true, value_parser = parse_env)]
     pub env: Option<Environment>,
-    /// Hide progress, notes and warnings; keep errors, hints and approvals
+    /// Hide progress, notes and warnings
     #[arg(short = 'q', long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
     /// Show steps
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
-    /// Diagnostic logs: debug for connect, trace for connect and wire
+    /// Diagnostic logs
     #[arg(long, global = true, value_enum)]
     pub log: Option<Log>,
 }
@@ -123,9 +120,9 @@ pub(crate) enum Log {
 // Top-level command palette, shared by parsing, help and shell completion
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Find hardware Arks and running emulators
+    /// List hardware Arks and running emulators
     Devices,
-    /// Show identity, trust, firmware, pairing and lock state
+    /// Show the Ark's identity, firmware, pairing and lock
     Status(Recovery),
     /// Verify the Ark against Dark Bio's device registry
     Genuine,
@@ -151,12 +148,12 @@ pub(crate) enum Command {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
-    /// Help for a command or a topic; --all prints the manual
+    /// Print help for a command or a topic
     Help {
-        /// Command path or topic name
+        /// Command, such as data upload, or topic name
         #[arg(num_args = 0.., value_name = "COMMAND_OR_TOPIC")]
         path: Vec<String>,
-        /// Print the whole manual: every command page and every topic
+        /// Print the whole manual, every page and topic
         #[arg(long, conflicts_with = "path")]
         all: bool,
     },
@@ -165,7 +162,7 @@ pub(crate) enum Command {
 // Explicit identity pin accepted by diagnostics and enrollment recovery
 #[derive(Args)]
 pub(crate) struct Recovery {
-    /// Pin an xDSA public key instead of verifying the attestation
+    /// Trust this public key instead of the attestation
     #[arg(
         long,
         value_name = "HEX",
@@ -178,7 +175,7 @@ pub(crate) struct Recovery {
 // Local attestation input and optional identity pin for enrollment
 #[derive(Args)]
 pub(crate) struct Enroll {
-    /// Install an existing signed attestation
+    /// Install the attestation in this file
     #[arg(long, value_name = "FILE")]
     pub cwt: Option<PathBuf>,
     // Recovery can authenticate a device whose stored attestation is unusable
@@ -191,46 +188,46 @@ pub(crate) struct Enroll {
 pub(crate) enum Data {
     /// Map the data paths an app can read
     Paths,
-    /// List dataset slots and their state
+    /// List the slots and their state
     List,
-    /// Show one slot's metadata, download URL and dependencies
+    /// Show one slot in full
     Show {
         /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot)]
         slot: i32,
     },
-    /// Upload a local dataset, approved on your phone
+    /// Upload the owner's variant calls, approved on your phone
     Upload {
-        /// Local dataset file to identify and upload
+        /// Variant call file (VCF) to upload
         file: PathBuf,
-        /// Require the Ark to identify this target slot
+        /// Fail unless the Ark identifies this slot
         #[arg(long, value_parser = parse_slot)]
         slot: Option<i32>,
-        /// Identify and plan without uploading or unlocking
+        /// Identify the file and plan, without changes
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
     },
-    /// Download and install public reference data
+    /// Download public reference data onto the Ark
     Fetch {
         /// Slot name or id from `ark data list`
         #[arg(value_parser = parse_slot, required_unless_present = "all", conflicts_with = "all")]
         slot: Option<i32>,
-        /// Fill empty reference slots in dependency order
+        /// Fetch every reference on offer, in order
         #[arg(long)]
         all: bool,
-        /// Show the download plan without changing the Ark
+        /// Show the plan without changing the Ark
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
-        /// Reference cache directory
+        /// Download cache directory
         #[arg(long, value_name = "DIR", conflicts_with = "no_cache")]
         cache: Option<PathBuf>,
-        /// Stream without retaining a local copy
+        /// Stream without keeping a copy
         #[arg(long)]
         no_cache: bool,
     },
     /// Empty a filled slot, approved on your phone
     Delete(Change),
-    /// Reset a slot to empty, approved on your phone
+    /// Erase a slot in any state, approved on your phone
     Repair(Change),
 }
 
@@ -240,7 +237,7 @@ pub(crate) struct Change {
     /// Slot name or id from `ark data list`
     #[arg(value_parser = parse_slot)]
     pub slot: i32,
-    /// Show state and dependents without changing the Ark
+    /// Show the plan without changing the Ark
     #[arg(long, conflicts_with = "unlock")]
     pub dry_run: bool,
 }
@@ -250,7 +247,7 @@ pub(crate) struct Change {
 pub(crate) enum App {
     /// Run an app, approved on your phone; print its report
     Run {
-        /// Local WebAssembly app
+        /// WebAssembly app to run
         file: PathBuf,
     },
 }
@@ -258,19 +255,22 @@ pub(crate) enum App {
 // Published firmware selection and installation, including read-only planning
 #[derive(Subcommand)]
 pub(crate) enum Firmware {
-    /// Show the installed build and update candidates
+    /// Show the installed build and the candidates
     List,
     /// Install firmware and reboot the Ark
     Update {
-        /// Ask the Ark to install this exact published build
+        /// Install this published build instead
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
-        /// Plan the update without approval or installation
+        /// Show the plan without installing
         #[arg(long, conflicts_with = "unlock")]
         dry_run: bool,
-        /// Return when installation is acknowledged, before the reboot is verified
+        /// Exit once installed, without waiting for the reboot
         #[arg(long)]
         no_wait: bool,
+        /// Confirm installing firmware and the reboot
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -410,6 +410,20 @@ mod tests {
             vec!["ark", "--log", "info"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    /// Checks that firmware confirmation is explicit and accepts both spellings.
+    #[test]
+    fn test_firmware_confirmation_accepts_both_spellings() {
+        for flag in [None, Some("-y"), Some("--yes")] {
+            let mut args = vec!["ark", "firmware", "update"];
+            args.extend(flag);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Firmware(Firmware::Update { yes, .. })) = cli.command else {
+                panic!("expected firmware update");
+            };
+            assert_eq!(yes, flag.is_some(), "{flag:?}");
         }
     }
 

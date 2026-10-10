@@ -63,10 +63,10 @@ fn main() -> ExitCode {
         Ok(matches) => matches,
         Err(error) => {
             let code = error.exit_code() as u8;
+            let mut options = Cli::parse_from(["ark"]).options;
+            options.json = json;
+            let output = output::Output::new(&options);
             if code != 0 {
-                let mut options = Cli::parse_from(["ark"]).options;
-                options.json = json;
-                let output = output::Output::new(&options);
                 let message = error.to_string();
                 let message = message
                     .split("\n\n")
@@ -79,8 +79,9 @@ fn main() -> ExitCode {
                     let _ = output.document(&json!({"error":error.json()}));
                 }
                 output.error(&error);
-            } else {
-                let _ = error.print();
+            } else if let Err(error) = output.text(&error.render().ansi().to_string()) {
+                output.error(&error);
+                return ExitCode::from(error.class);
             }
             return ExitCode::from(code);
         }
@@ -133,7 +134,7 @@ fn main() -> ExitCode {
     let result = if let Err(error) = validation {
         Err(error)
     } else if cli.help {
-        help::run(&[], cli.all)
+        help::run(&context.output, &[], cli.all)
     } else if cli.version {
         context.output.document(&versions())
     } else {
@@ -160,10 +161,12 @@ fn main() -> ExitCode {
 /// discovery.
 fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
     match command {
-        None => {
-            help::command(&help::theme()).print_help()?;
-            Ok(())
-        }
+        None => context.output.text(
+            &help::command(&help::theme())
+                .render_help()
+                .ansi()
+                .to_string(),
+        ),
         Some(Command::Devices) => device::devices(context),
         Some(Command::Status(args)) => device::status(context, args),
         Some(Command::Genuine) => device::genuine(context),
@@ -174,7 +177,7 @@ fn run(context: &Context, command: Option<Command>) -> Result<(), Error> {
         Some(Command::Firmware(command)) => firmware::run(context, command),
         Some(Command::Pair) => pairing::run(context),
         Some(Command::Doctor) => doctor::run(context),
-        Some(Command::Help { path, all }) => help::run(&path, all),
+        Some(Command::Help { path, all }) => help::run(&context.output, &path, all),
         Some(Command::Completions { shell }) => {
             clap_complete::generate(
                 shell,
